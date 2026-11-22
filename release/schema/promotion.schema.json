@@ -1,0 +1,66 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "$id": "https://updates.legatto.pl/schema/promotion.schema.json",
+  "title": "Legatto channel promotion (legatto-promote/1)",
+  "description": "Explicit promotion of one manifest to early or stable (D7(b)). Published as releases/<version>/promote/<channel>.json with signatures <file>.<signer-id>.sig from `ssh-keygen -Y sign -n legatto-promote`. Binds the exact manifest bytes and a green canary attestation. `promoted_at` is informational only: the server measures the minimum delay (policy.json) from the moment it first saw and verified this document.",
+  "type": "object",
+  "additionalProperties": false,
+  "required": [
+    "schema",
+    "product",
+    "version",
+    "sequence",
+    "type",
+    "channel",
+    "manifest_sha256",
+    "canary_attestation_sha256",
+    "promoted_at"
+  ],
+  "properties": {
+    "schema": { "const": "legatto-promote/1" },
+    "product": { "const": "legatto" },
+    "version": { "$ref": "#/$defs/semver" },
+    "sequence": {
+      "description": "Must equal `sequence` of the referenced manifest.",
+      "type": "integer",
+      "minimum": 1
+    },
+    "type": {
+      "description": "Must equal `type` of the referenced manifest; selects the delay row in policy.json.",
+      "enum": ["security", "feature"]
+    },
+    "channel": { "enum": ["early", "stable"] },
+    "manifest_sha256": {
+      "description": "sha256 of the exact manifest.json bytes.",
+      "$ref": "#/$defs/sha256"
+    },
+    "canary_attestation_sha256": {
+      "description": "sha256 of releases/<version>/attest/canary.json; that document must carry a valid canary signature and result PASS for this manifest.",
+      "$ref": "#/$defs/sha256"
+    },
+    "early_promotion_sha256": {
+      "description": "channel=stable only: sha256 of promote/early.json of the same release, which must itself be valid.",
+      "$ref": "#/$defs/sha256"
+    },
+    "promoted_at": {
+      "type": "string",
+      "format": "date-time",
+      "pattern": "^[0-9]{4}-[0-9]{2}-[0-9]{2}T[0-9]{2}:[0-9]{2}:[0-9]{2}Z$"
+    },
+    "note": { "type": "string", "maxLength": 500 }
+  },
+  "allOf": [
+    {
+      "if": { "properties": { "channel": { "const": "stable" } } },
+      "then": { "required": ["early_promotion_sha256"] },
+      "else": { "not": { "required": ["early_promotion_sha256"] } }
+    }
+  ],
+  "$defs": {
+    "semver": {
+      "type": "string",
+      "pattern": "^(0|[1-9][0-9]*)\\.(0|[1-9][0-9]*)\\.(0|[1-9][0-9]*)(-(0|[1-9][0-9]*|[0-9]*[A-Za-z-][0-9A-Za-z-]*)(\\.(0|[1-9][0-9]*|[0-9]*[A-Za-z-][0-9A-Za-z-]*))*)?$"
+    },
+    "sha256": { "type": "string", "pattern": "^[0-9a-f]{64}$" }
+  }
+}

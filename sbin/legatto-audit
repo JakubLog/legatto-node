@@ -1,0 +1,670 @@
+#!/usr/bin/python3
+"""legatto-audit — the single writer of the hash-chained audit log.
+
+CONTRACT §4.2. Every component appends through `legatto-audit append`; nobody
+else opens /var/log/legatto/audit.log for writing. The file carries
+`chattr +a` (set by the breakglass role); this tool only ever opens it with
+O_APPEND.
+
+Entry (one JSON line):
+    {"seq","ts","host","cat","event","actor","node","params","prev","hash"}
+    hash = sha256(canonical(entry without "hash"))
+    canonical = json.dumps(obj, sort_keys=True, separators=(",", ":"),
+                           ensure_ascii=False).encode("utf-8")
+
+Subcommands:
+    append --cat C --event E --actor JSON [--node N] --params JSON
+    verify [--from SEQ] [--json]
+    head [--json]
+    ssh-follow            (legatto-audit-ssh.service: journald -> ssh.*/sudo.*)
+
+Exit codes: 0 OK, 1 other error, 2 bad arguments, 3 lock busy for 10 s,
+4 precondition (not root), 30 chain broken (verify).
+"""
+
+from __future__ import annotations
+
+import argparse
+import errno
+import fcntl
+import grp
+import hashlib
+import json
+import os
+import re
+import struct
+import subprocess
+import sys
+import tempfile
+import time
+from datetime import datetime, timezone
+
+# Tests point every path below a scratch directory; production never sets it.
+ROOT = os.environ.get("LEGATTO_TEST_ROOT", "")
+if not ROOT:
+    os.environ["PATH"] = "/usr/local/sbin:/usr/local/bin:/usr/sbin:/usr/bin:/sbin:/bin"
+
+AUDIT_LOG = ROOT + "/var/log/legatto/audit.log"  # contract: legatto_paths.audit_log
+AUDIT_LOCK = AUDIT_LOG + ".lock"
+STATUS_DIR = ROOT + "/var/lib/legatto/status"  # contract: legatto_paths.status
+AUDIT_STATE = ROOT + "/var/lib/legatto/audit"  # contract: legatto_paths.audit_state
+OFFICE_ENV = ROOT + "/etc/legatto/office.env"  # contract: legatto_paths.office_env
+STATUS_GROUP = "legatto-status"  # contract: legatto_groups.status
+AUDIT_GROUP = "legatto-audit"  # contract: legatto_groups.audit
+GENESIS_PREV = "0" * 64  # contract: legatto_audit.genesis_prev
+FIELDS = ("seq", "ts", "host", "cat", "event", "actor", "node", "params", "prev", "hash")  # contract: legatto_audit.fields
+CATEGORIES = (  # contract: legatto_audit.categories
+    "ansible", "breakglass", "ssh", "sudo", "admin", "fw", "update", "console", "egress",
+    "backup", "intake", "publish", "studio", "device",
+)
+ACTOR_KINDS = ("office-admin", "vendor", "system", "bootstrap")
+VENDOR_RE = re.compile(r"^v-[a-z][a-z0-9-]{1,20}$")  # contract: legatto_vendor_login_regex
+ACTOR_ID_RE = re.compile(r"^[A-Za-z0-9][A-Za-z0-9._@:-]{0,62}$")
+EVENT_RE = re.compile(r"^[a-z]+(\.[a-z0-9_]+){1,3}$")
+LOCK_TIMEOUT_S = 10
+MAX_PARAMS_BYTES = 4096
+# Keys that must never reach the audit log (CONTRACT §4.2: no passwords, TOTP
+# codes, pre-auth keys). Checked recursively, case-insensitive substring.
+FORBIDDEN_KEY_PARTS = ("password", "passwd", "totp", "secret", "token", "authkey", "auth_key", "preauth", "private")
+
+EXIT_OK, EXIT_ERR, EXIT_ARGS, EXIT_LOCK, EXIT_PRECOND, EXIT_CHAIN = 0, 1, 2, 3, 4, 30
+
+FS_IOC_GETFLAGS = 0x80086601
+FS_APPEND_FL = 0x00000020
+
+
+class AuditError(Exception):
+    def __init__(self, message: str, code: int = EXIT_ERR):
+        super().__init__(message)
+        self.code = code
+
+
+def utcnow() -> str:
+    return datetime.now(timezone.utc).strftime("%Y-%m-%dT%H:%M:%SZ")
+
+
+def canonical(obj: object) -> bytes:
+    return json.dumps(obj, sort_keys=True, separators=(",", ":"), ensure_ascii=False).encode("utf-8")
+
+
+def entry_hash(entry: dict) -> str:
+    body = {k: v for k, v in entry.items() if k != "hash"}
+    return hashlib.sha256(canonical(body)).hexdigest()
+
+
+def read_office_env() -> dict:
+    values: dict = {}
+    try:
+        with open(OFFICE_ENV, encoding="utf-8") as fh:
+            for line in fh:
+                line = line.rstrip("\n")
+                if not line or line.startswith("#") or "=" not in line:
+                    continue
+                key, value = line.split("=", 1)
+                values[key] = value
+    except FileNotFoundError:
+        pass
+    return values
+
+
+def host_name() -> str:
+    slug = read_office_env().get("LEGATTO_SLUG")
+    if slug:
+        return slug
+    return os.uname().nodename
+
+
+def atomic_write(path: str, data: bytes, mode: int, group: str | None) -> None:
+    directory = os.path.dirname(path)
+    fd, tmp = tempfile.mkstemp(prefix=".tmp-", dir=directory)
+    try:
+        os.write(fd, data)
+        os.fsync(fd)
+        os.fchmod(fd, mode)
+        if group and os.geteuid() == 0:
+            try:
+                os.fchown(fd, 0, grp.getgrnam(group).gr_gid)
+            except KeyError:
+                pass
+        os.close(fd)
+        fd = -1
+        os.rename(tmp, path)
+        dfd = os.open(directory, os.O_RDONLY)
+        try:
+            os.fsync(dfd)
+        finally:
+            os.close(dfd)
+    finally:
+        if fd >= 0:
+            os.close(fd)
+        if os.path.exists(tmp):
+            os.unlink(tmp)
+
+
+def write_status(fields: dict) -> None:
+    """Write status/audit.json, keeping fields this call does not know."""
+    path = os.path.join(STATUS_DIR, "audit.json")
+    current: dict = {}
+    try:
+        with open(path, encoding="utf-8") as fh:
+            current = json.load(fh)
+    except (FileNotFoundError, ValueError):
+        current = {}
+    doc = {
+        "v": 1,
+        "component": "audit",
+        "ts": utcnow(),
+        "seq": current.get("seq", 0),
+        "head": current.get("head", GENESIS_PREV),
+        "verified_at": current.get("verified_at"),
+        "chain_ok": current.get("chain_ok", False),
+    }
+    doc.update(fields)
+    doc["ok"] = bool(doc["chain_ok"])
+    if not os.path.isdir(STATUS_DIR):
+        return
+    atomic_write(path, json.dumps(doc, sort_keys=True).encode() + b"\n", 0o640, STATUS_GROUP)
+
+
+def read_status() -> dict:
+    try:
+        with open(os.path.join(STATUS_DIR, "audit.json"), encoding="utf-8") as fh:
+            return json.load(fh)
+    except (FileNotFoundError, ValueError):
+        return {}
+
+
+class FileLock:
+    def __init__(self, path: str, timeout: float = LOCK_TIMEOUT_S):
+        self.path = path
+        self.timeout = timeout
+        self.fd = -1
+
+    def __enter__(self) -> "FileLock":
+        self.fd = os.open(self.path, os.O_RDWR | os.O_CREAT, 0o600)
+        deadline = time.monotonic() + self.timeout
+        while True:
+            try:
+                fcntl.flock(self.fd, fcntl.LOCK_EX | fcntl.LOCK_NB)
+                return self
+            except OSError as exc:
+                if exc.errno not in (errno.EAGAIN, errno.EACCES):
+                    raise
+            if time.monotonic() >= deadline:
+                os.close(self.fd)
+                self.fd = -1
+                raise AuditError(f"lock busy for {self.timeout:.0f} s: {self.path}", EXIT_LOCK)
+            time.sleep(0.05)
+
+    def __exit__(self, *_exc: object) -> None:
+        if self.fd >= 0:
+            fcntl.flock(self.fd, fcntl.LOCK_UN)
+            os.close(self.fd)
+
+
+def read_last_line(path: str) -> bytes | None:
+    """Return the last complete line (without newline) or None for an empty file.
+
+    A file that does not end with a newline has a torn last write; appending
+    after it would hide the damage, so it is an error.
+    """
+    try:
+        fd = os.open(path, os.O_RDONLY)
+    except FileNotFoundError:
+        return None
+    try:
+        size = os.fstat(fd).st_size
+        if size == 0:
+            return None
+        os.lseek(fd, size - 1, os.SEEK_SET)
+        if os.read(fd, 1) != b"\n":
+            raise AuditError("audit log does not end with a newline (torn write); run `legatto-audit verify`")
+        # Scan backwards from the byte before the final newline.
+        pos = size - 1
+        buf = b""
+        while pos > 0:
+            step = min(4096, pos)
+            pos -= step
+            os.lseek(fd, pos, os.SEEK_SET)
+            buf = os.read(fd, step) + buf
+            idx = buf.rfind(b"\n")
+            if idx >= 0:
+                return buf[idx + 1:]
+        return buf
+    finally:
+        os.close(fd)
+
+
+def parse_entry(raw: bytes) -> dict:
+    try:
+        entry = json.loads(raw.decode("utf-8"))
+    except (UnicodeDecodeError, ValueError) as exc:
+        raise AuditError(f"unparsable audit entry: {exc}") from exc
+    if not isinstance(entry, dict):
+        raise AuditError("audit entry is not an object")
+    return entry
+
+
+# --- validation ------------------------------------------------------------------
+
+def validate_actor(raw: str) -> dict:
+    try:
+        actor = json.loads(raw)
+    except ValueError as exc:
+        raise AuditError(f"--actor is not JSON: {exc}", EXIT_ARGS) from exc
+    if not isinstance(actor, dict) or set(actor) - {"kind", "id", "node", "ip", "user"}:
+        raise AuditError("--actor must be an object with kind, id [, node, ip, user]", EXIT_ARGS)
+    kind = actor.get("kind")
+    ident = actor.get("id")
+    if kind not in ACTOR_KINDS:
+        raise AuditError(f"actor.kind must be one of {', '.join(ACTOR_KINDS)}", EXIT_ARGS)
+    if not isinstance(ident, str) or not ACTOR_ID_RE.match(ident):
+        raise AuditError("actor.id missing or malformed", EXIT_ARGS)
+    if kind == "vendor" and not VENDOR_RE.match(ident):
+        raise AuditError("actor.id of a vendor must be a v-<name> account", EXIT_ARGS)
+    for key in ("node", "ip", "user"):
+        value = actor.get(key)
+        if value is not None and (not isinstance(value, str) or len(value) > 255):
+            raise AuditError(f"actor.{key} must be a short string", EXIT_ARGS)
+    return actor
+
+
+def forbidden_keys(obj: object, path: str = "") -> list:
+    found = []
+    if isinstance(obj, dict):
+        for key, value in obj.items():
+            lowered = str(key).lower()
+            if any(part in lowered for part in FORBIDDEN_KEY_PARTS):
+                found.append(f"{path}{key}")
+            found.extend(forbidden_keys(value, f"{path}{key}."))
+    elif isinstance(obj, list):
+        for index, value in enumerate(obj):
+            found.extend(forbidden_keys(value, f"{path}{index}."))
+    return found
+
+
+def validate_params(raw: str) -> dict:
+    try:
+        params = json.loads(raw)
+    except ValueError as exc:
+        raise AuditError(f"--params is not JSON: {exc}", EXIT_ARGS) from exc
+    if not isinstance(params, dict):
+        raise AuditError("--params must be a JSON object", EXIT_ARGS)
+    if len(canonical(params)) > MAX_PARAMS_BYTES:
+        raise AuditError(f"--params larger than {MAX_PARAMS_BYTES} bytes", EXIT_ARGS)
+    bad = forbidden_keys(params)
+    if bad:
+        raise AuditError(f"--params contains forbidden keys: {', '.join(bad)}", EXIT_ARGS)
+    return params
+
+
+def validate_event(cat: str, event: str) -> None:
+    if cat not in CATEGORIES:
+        raise AuditError(f"--cat must be one of {', '.join(CATEGORIES)}", EXIT_ARGS)
+    if not EVENT_RE.match(event) or event.split(".", 1)[0] != cat:
+        raise AuditError("--event must be '<cat>.<name>' in lower case", EXIT_ARGS)
+
+
+# --- append -------------------------------------------------------------------------
+
+def append(cat: str, event: str, actor: dict, node: str | None, params: dict) -> dict:
+    os.makedirs(os.path.dirname(AUDIT_LOG), exist_ok=True)
+    with FileLock(AUDIT_LOCK):
+        last_raw = read_last_line(AUDIT_LOG)
+        if last_raw is None:
+            seq, prev = 1, GENESIS_PREV
+        else:
+            last = parse_entry(last_raw)
+            if entry_hash(last) != last.get("hash"):
+                raise AuditError("last audit entry fails its hash; refusing to extend a damaged chain")
+            if not isinstance(last.get("seq"), int):
+                raise AuditError("last audit entry has no integer seq")
+            seq, prev = last["seq"] + 1, last["hash"]
+        entry = {
+            "seq": seq,
+            "ts": utcnow(),
+            "host": host_name(),
+            "cat": cat,
+            "event": event,
+            "actor": actor,
+            "node": node,
+            "params": params,
+            "prev": prev,
+        }
+        entry["hash"] = entry_hash(entry)
+        line = canonical(entry) + b"\n"
+        created = not os.path.exists(AUDIT_LOG)
+        fd = os.open(AUDIT_LOG, os.O_WRONLY | os.O_APPEND | os.O_CREAT, 0o640)
+        try:
+            if created and os.geteuid() == 0:
+                try:
+                    os.fchown(fd, 0, grp.getgrnam(AUDIT_GROUP).gr_gid)
+                except KeyError:
+                    pass
+            written = os.write(fd, line)
+            if written != len(line):
+                raise AuditError("short write to audit log")
+            os.fsync(fd)
+        finally:
+            os.close(fd)
+    return {"seq": seq, "hash": entry["hash"]}
+
+
+# --- verify ------------------------------------------------------------------------
+
+def append_only_flag(path: str) -> bool | None:
+    try:
+        fd = os.open(path, os.O_RDONLY)
+    except OSError:
+        return None
+    try:
+        buf = fcntl.ioctl(fd, FS_IOC_GETFLAGS, struct.pack("l", 0))
+        return bool(struct.unpack("l", buf)[0] & FS_APPEND_FL)
+    except OSError:
+        return None
+    finally:
+        os.close(fd)
+
+
+def verify(from_seq: int | None) -> dict:
+    errors: list = []
+    entries = 0
+    first_seq = None
+    last_seq = 0
+    head = GENESIS_PREV
+    expected_seq = None
+    seen_hash_at: dict = {}
+    anchor = read_status() if from_seq is None else {}
+    anchor_seq = anchor.get("seq") if isinstance(anchor.get("seq"), int) else 0
+    anchor_head = anchor.get("head")
+
+    def fail(lineno: int, seq: object, reason: str) -> None:
+        if len(errors) < 50:
+            errors.append({"line": lineno, "seq": seq, "reason": reason})
+
+    try:
+        fh = open(AUDIT_LOG, "rb")
+    except FileNotFoundError:
+        fh = None
+    if fh is not None:
+        with fh:
+            for lineno, raw in enumerate(fh, start=1):
+                if not raw.endswith(b"\n"):
+                    fail(lineno, None, "torn last line (no newline)")
+                    break
+                try:
+                    entry = parse_entry(raw.rstrip(b"\n"))
+                except AuditError as exc:
+                    fail(lineno, None, str(exc))
+                    expected_seq = None
+                    continue
+                seq = entry.get("seq")
+                if from_seq is not None and isinstance(seq, int) and seq < from_seq:
+                    continue
+                entries += 1
+                if tuple(sorted(entry)) != tuple(sorted(FIELDS)):
+                    fail(lineno, seq, "unexpected field set")
+                if not isinstance(seq, int):
+                    fail(lineno, seq, "seq is not an integer")
+                    continue
+                if first_seq is None:
+                    first_seq = seq
+                    if from_seq is None and seq != 1:
+                        fail(lineno, seq, "chain does not start at seq 1")
+                    if from_seq is None and entry.get("prev") != GENESIS_PREV:
+                        fail(lineno, seq, "first entry prev is not the genesis value")
+                else:
+                    if seq != expected_seq:
+                        fail(lineno, seq, f"seq gap or reorder (expected {expected_seq})")
+                    if entry.get("prev") != head:
+                        fail(lineno, seq, "prev does not match the hash of the previous entry")
+                computed = entry_hash(entry)
+                if computed != entry.get("hash"):
+                    fail(lineno, seq, "hash mismatch (entry modified)")
+                cat = entry.get("cat")
+                event = entry.get("event")
+                if not isinstance(event, str) or not isinstance(cat, str) or event.split(".", 1)[0] != cat:
+                    fail(lineno, seq, "event does not belong to its category")
+                head = entry.get("hash") if isinstance(entry.get("hash"), str) else computed
+                last_seq = seq
+                expected_seq = seq + 1
+                if anchor_seq and seq == anchor_seq:
+                    seen_hash_at[seq] = head
+    if from_seq is not None and first_seq is not None and first_seq != from_seq:
+        errors.append({"line": None, "seq": from_seq, "reason": f"entry {from_seq} not found"})
+    if anchor_seq:
+        if last_seq < anchor_seq:
+            errors.append({"line": None, "seq": anchor_seq,
+                           "reason": f"log shorter than last recorded head (seq {anchor_seq}); entries removed"})
+        elif anchor_head and seen_hash_at.get(anchor_seq) != anchor_head:
+            errors.append({"line": None, "seq": anchor_seq,
+                           "reason": "entry at last recorded head differs (chain rewritten)"})
+    return {
+        "ok": not errors,
+        "entries": entries,
+        "first_seq": first_seq,
+        "last_seq": last_seq,
+        "head": head,
+        "append_only": append_only_flag(AUDIT_LOG),
+        "errors": errors,
+    }
+
+
+def head() -> dict:
+    raw = read_last_line(AUDIT_LOG)
+    if raw is None:
+        return {"seq": 0, "hash": GENESIS_PREV}
+    entry = parse_entry(raw)
+    return {"seq": entry.get("seq"), "hash": entry.get("hash")}
+
+
+# --- ssh-follow (legatto-audit-ssh.service) ---------------------------------------------
+
+SSH_ACCEPTED = re.compile(
+    r"^Accepted publickey for (?P<user>\S+) from (?P<ip>\S+) port (?P<port>\d+) \S+: (?P<alg>\S+) (?P<fp>SHA256:\S+)")
+SSH_DISCONNECTED = re.compile(r"^Disconnected from user (?P<user>\S+) (?P<ip>\S+) port (?P<port>\d+)")
+SSH_FAILED = [
+    re.compile(r"^Failed (?P<method>\S+) for (?:invalid user )?(?P<user>\S+) from (?P<ip>\S+) port (?P<port>\d+)"),
+    re.compile(r"^Invalid user (?P<user>\S*) from (?P<ip>\S+) port (?P<port>\d+)"),
+    re.compile(r"^Connection (?:closed|reset) by (?:authenticating|invalid) user (?P<user>\S+) (?P<ip>\S+) port "
+               r"(?P<port>\d+) \[preauth\]"),
+    re.compile(r"^User (?P<user>\S+) from (?P<ip>\S+) not allowed because"),
+]
+SUDO_LINE = re.compile(
+    r"^\s*(?P<user>\S+) : (?:(?P<reason>[^;]*?) ; )?(?:TTY=\S+ ; )?PWD=.*? ; USER=(?P<runas>\S+) ;"
+    r"(?: GROUP=\S+ ;)?(?: TSID=\S+ ;)?(?: ENV=.*? ;)? COMMAND=(?P<cmd>.*)$")
+FAIL_LIMIT_PER_MIN = 60
+COMMAND_MAX_CHARS = 300
+
+
+def whois_node(ip: str) -> str | None:
+    try:
+        out = subprocess.run(["tailscale", "whois", "--json", ip], capture_output=True, text=True, timeout=5,
+                             check=False)
+    except (OSError, subprocess.TimeoutExpired):
+        return None
+    if out.returncode != 0:
+        return None
+    try:
+        data = json.loads(out.stdout)
+    except ValueError:
+        return None
+    node = data.get("Node") or {}
+    name = node.get("ComputedName") or node.get("Name") or ""
+    return name.rstrip(".") or None
+
+
+def system_actor() -> dict:
+    return {"kind": "system", "id": "legatto-audit-ssh"}
+
+
+def vendor_actor(user: str) -> dict:
+    if VENDOR_RE.match(user):
+        return {"kind": "vendor", "id": user}
+    return {"kind": "system", "id": "sshd", "user": user[:64]}
+
+
+class SshFollower:
+    def __init__(self) -> None:
+        self.fail_window = 0
+        self.fail_count = 0
+        self.suppressed = 0
+
+    def _fail_allowed(self) -> bool:
+        minute = int(time.time() // 60)
+        if minute != self.fail_window:
+            if self.suppressed:
+                append("ssh", "ssh.fail", system_actor(), None, {"suppressed": self.suppressed})
+            self.fail_window, self.fail_count, self.suppressed = minute, 0, 0
+        self.fail_count += 1
+        if self.fail_count > FAIL_LIMIT_PER_MIN:
+            self.suppressed += 1
+            return False
+        return True
+
+    def handle(self, record: dict) -> None:
+        ident = record.get("SYSLOG_IDENTIFIER")
+        message = record.get("MESSAGE")
+        if isinstance(message, list):  # journald encodes non-UTF-8 as a byte array
+            message = bytes(message).decode("utf-8", "replace")
+        if not isinstance(message, str):
+            return
+        if ident == "sudo":
+            match = SUDO_LINE.match(message)
+            if not match:
+                return
+            params = {
+                "user": match.group("user")[:64],
+                "runas": match.group("runas")[:64],
+                "command": match.group("cmd")[:COMMAND_MAX_CHARS],
+            }
+            if match.group("reason"):
+                params["denied"] = match.group("reason").strip()[:120]
+            append("sudo", "sudo.command", vendor_actor(match.group("user")), None, params)
+            return
+        match = SSH_ACCEPTED.match(message)
+        if match:
+            ip = match.group("ip")
+            append("ssh", "ssh.login", vendor_actor(match.group("user")), whois_node(ip), {
+                "user": match.group("user")[:64], "ip": ip, "port": int(match.group("port")),
+                "key_alg": match.group("alg"), "key_fp": match.group("fp")})
+            return
+        match = SSH_DISCONNECTED.match(message)
+        if match:
+            ip = match.group("ip")
+            append("ssh", "ssh.logout", vendor_actor(match.group("user")), whois_node(ip), {
+                "user": match.group("user")[:64], "ip": ip, "port": int(match.group("port"))})
+            return
+        for pattern in SSH_FAILED:
+            match = pattern.match(message)
+            if match:
+                if self._fail_allowed():
+                    append("ssh", "ssh.fail", system_actor(), None, {
+                        "user": (match.group("user") or "")[:64], "ip": match.group("ip"),
+                        "msg": message[:160]})
+                return
+
+
+def ssh_follow() -> int:
+    os.makedirs(AUDIT_STATE, mode=0o700, exist_ok=True)
+    cursor_file = os.path.join(AUDIT_STATE, "ssh.cursor")
+    cmd = ["journalctl", "--follow", "--output=json", "--no-pager", f"--cursor-file={cursor_file}",
+           "_SYSTEMD_UNIT=ssh.service", "+", "SYSLOG_IDENTIFIER=sudo"]
+    if not os.path.exists(cursor_file):
+        cmd.insert(1, "--since=now")
+    follower = SshFollower()
+    proc = subprocess.Popen(cmd, stdout=subprocess.PIPE, text=True, bufsize=1)
+    assert proc.stdout is not None
+    for line in proc.stdout:
+        try:
+            record = json.loads(line)
+        except ValueError:
+            continue
+        try:
+            follower.handle(record)
+        except AuditError as exc:
+            print(f"legatto-audit ssh-follow: {exc}", file=sys.stderr)
+            if exc.code == EXIT_ERR:
+                proc.terminate()
+                return EXIT_ERR
+    return proc.wait()
+
+
+# --- CLI ---------------------------------------------------------------------------------
+
+def main(argv: list) -> int:
+    parser = argparse.ArgumentParser(prog="legatto-audit", description=__doc__.split("\n\n")[0])
+    sub = parser.add_subparsers(dest="cmd", required=True)
+    p_append = sub.add_parser("append", help="append one entry (single writer, flock)")
+    p_append.add_argument("--cat", required=True)
+    p_append.add_argument("--event", required=True)
+    p_append.add_argument("--actor", required=True)
+    p_append.add_argument("--node", default=None)
+    p_append.add_argument("--params", required=True)
+    p_append.add_argument("--json", action="store_true", help="accepted for symmetry; output is always JSON")
+    p_verify = sub.add_parser("verify", help="verify the hash chain")
+    p_verify.add_argument("--from", dest="from_seq", type=int, default=None)
+    p_verify.add_argument("--json", action="store_true")
+    p_head = sub.add_parser("head", help="print the last seq and hash")
+    p_head.add_argument("--json", action="store_true")
+    sub.add_parser("ssh-follow", help="follow sshd/sudo in journald (legatto-audit-ssh.service)")
+    try:
+        args = parser.parse_args(argv)
+    except SystemExit as exc:
+        return EXIT_ARGS if exc.code else EXIT_OK
+
+    try:
+        if args.cmd == "append":
+            if os.geteuid() != 0 and not ROOT:
+                raise AuditError("must run as root", EXIT_PRECOND)
+            validate_event(args.cat, args.event)
+            actor = validate_actor(args.actor)
+            params = validate_params(args.params)
+            node = args.node
+            if node is not None and (len(node) > 255 or not node.strip()):
+                raise AuditError("--node must be a short non-empty string", EXIT_ARGS)
+            print(json.dumps(append(args.cat, args.event, actor, node, params)))
+            return EXIT_OK
+        if args.cmd == "verify":
+            result = verify(args.from_seq)
+            if args.from_seq is None and (os.geteuid() == 0 or ROOT):
+                # A broken chain never moves the recorded anchor: otherwise a
+                # truncated log would look healthy on the next run.
+                fields = {"verified_at": utcnow(), "chain_ok": result["ok"]}
+                if result["ok"]:
+                    fields.update({"seq": result["last_seq"], "head": result["head"]})
+                write_status(fields)
+            if args.json:
+                print(json.dumps(result, sort_keys=True))
+            else:
+                state = "OK" if result["ok"] else "BROKEN"
+                print(f"chain {state}: {result['entries']} entries, head seq {result['last_seq']} "
+                      f"{result['head'][:16]}", file=sys.stderr)
+                for err in result["errors"]:
+                    print(f"  line {err['line']} seq {err['seq']}: {err['reason']}", file=sys.stderr)
+            return EXIT_OK if result["ok"] else EXIT_CHAIN
+        if args.cmd == "head":
+            result = head()
+            recorded = read_status().get("seq")
+            if (os.geteuid() == 0 or ROOT) and (not isinstance(recorded, int) or result["seq"] >= recorded):
+                write_status({"seq": result["seq"], "head": result["hash"]})
+            if args.json:
+                print(json.dumps(result))
+            else:
+                print(f"{result['seq']} {result['hash']}")
+            return EXIT_OK
+        if args.cmd == "ssh-follow":
+            if os.geteuid() != 0 and not ROOT:
+                raise AuditError("must run as root", EXIT_PRECOND)
+            return ssh_follow()
+    except AuditError as exc:
+        print(f"legatto-audit: {exc}", file=sys.stderr)
+        return exc.code
+    except OSError as exc:
+        print(f"legatto-audit: {exc}", file=sys.stderr)
+        return EXIT_ERR
+    return EXIT_ARGS
+
+
+if __name__ == "__main__":
+    sys.exit(main(sys.argv[1:]))

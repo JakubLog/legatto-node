@@ -1,0 +1,287 @@
+#!/usr/bin/python3
+"""legatto-tailnet — tailnet membership of the office (CONTRACT §4.6).
+
+  enroll --kind staff|office-device [--login L] --actor J --json
+        one-time pre-auth key (TTL 30 min). The key is printed only to stdout
+        for the executor's result file; it is never logged or audited.
+  revoke --node-id N --actor J [--json]
+        delete a node (never the server's own tag:server node) and drop its flows
+  staff-set --file F --actor J [--json]
+        F = {"v":1,"staff":[logins]}: writes staff.json, creates the Headscale
+        users, removes nodes and users of dropped staff, applies the policy
+  nodes [--json]
+        node list for the console
+
+Ansible only (break-glass window):
+  vendors-set --file F --actor J     F = {"vendors":[v-<name>...]}: Headscale users of vendors
+  vendor-key --login v-X --actor J --json   one-time key for a vendor control machine
+
+Exit codes: 0 OK, 1 error, 2 bad arguments, 3 lock busy, 4 precondition,
+24 login or node does not exist.
+"""
+
+from __future__ import annotations
+
+import argparse
+import json
+import os
+import sys
+
+if os.environ.get("LEGATTO_TEST_ROOT") and os.environ.get("LEGATTO_NET_LIB"):
+    sys.path.insert(0, os.environ["LEGATTO_NET_LIB"])
+sys.path.insert(1, os.path.join(os.path.dirname(os.path.realpath(__file__)), "..", "lib", "net"))
+import legatto_net as ln  # noqa: E402
+
+EXIT_MISSING = 24
+STAFF_FILE = os.path.join(ln.TAILNET_DIR, "staff.json")
+LOCK = os.path.join(ln.RUN_DIR, "tailnet.lock")
+PREAUTH_TTL = "30m"  # contract: legatto_preauth_key_ttl
+MAX_INPUT_BYTES = 65536
+
+
+def load_staff() -> list:
+    doc = ln.read_json(STAFF_FILE, default={"v": 1, "staff": []})
+    staff = doc.get("staff", []) if isinstance(doc, dict) else []
+    return [s for s in staff if isinstance(s, str) and ln.STAFF_RE.match(s)]
+
+
+def read_list_file(path: str, key: str, pattern: object) -> list:
+    try:
+        if os.path.getsize(path) > MAX_INPUT_BYTES:
+            raise ln.ToolError(f"{path}: larger than {MAX_INPUT_BYTES} bytes", ln.EXIT_ARGS)
+        with open(path, encoding="utf-8") as fh:
+            doc = json.load(fh)
+    except (OSError, ValueError) as exc:
+        raise ln.ToolError(f"{path}: {exc}", ln.EXIT_ARGS) from exc
+    if not isinstance(doc, dict) or doc.get("v", 1) != 1 or not isinstance(doc.get(key), list):
+        raise ln.ToolError(f"{path}: expected {{\"v\":1,\"{key}\":[...]}}", ln.EXIT_ARGS)
+    values = doc[key]
+    bad = [v for v in values if not isinstance(v, str) or not pattern.match(v)]
+    if bad:
+        raise ln.ToolError(f"{path}: invalid {key} entries: {bad[:5]}", ln.EXIT_ARGS)
+    return sorted(set(values))
+
+
+def login_server() -> str:
+    host = ln.read_office_env().get("LEGATTO_HOST_VPN")
+    if not host:
+        raise ln.ToolError("office.env has no LEGATTO_HOST_VPN", ln.EXIT_PRECOND)
+    return f"https://{host}"
+
+
+def ensure_user(name: str, users: dict) -> str:
+    if name not in users:
+        ln.run(["headscale", "users", "create", name])
+        users.update(ln.headscale_users())
+    if name not in users:
+        raise ln.ToolError(f"headscale did not create user {name}")
+    return users[name]
+
+
+def create_key(args: list) -> dict:
+    doc = ln.headscale_json(["preauthkeys", "create", "--expiration", PREAUTH_TTL, *args])
+    if not isinstance(doc, dict) or not doc.get("key"):
+        raise ln.ToolError("headscale preauthkeys create: no key in output")
+    expires = ln.ts_field(doc.get("expiration"))
+    return {"key": doc["key"], "expires_at": expires}
+
+
+def drop_flows(node: dict) -> None:
+    for ip in node["ips"]:
+        family = ["-f", "ipv6"] if ":" in ip else []
+        for direction in ("-s", "-d"):
+            ln.run(["conntrack", "-D", *family, direction, ip], check=False, timeout=15)
+
+
+def delete_node(node: dict) -> None:
+    ln.run(["headscale", "nodes", "delete", "--identifier", node["id"], "--force"])
+    drop_flows(node)
+
+
+def remove_users(names: list, actor: dict) -> list:
+    """Delete every node of the given users, then the users. Returns deleted node ids."""
+    if not names:
+        return []
+    deleted = []
+    for node in ln.headscale_nodes():
+        if node["user"] in names and not node["tags"]:
+            delete_node(node)
+            deleted.append(node["id"])
+            ln.audit("device", "device.revoke", actor, {
+                "node_id": node["id"], "name": node["name"], "user": node["user"], "reason": "user removed"})
+    for name in names:
+        ln.run(["headscale", "users", "destroy", "--name", name, "--force"])
+    return deleted
+
+
+def apply_policy(actor: dict) -> dict:
+    proc = ln.run([ln.tool("legatto-policy"), "apply", "--json", "--actor", json.dumps(actor)],
+                  check=False, timeout=180)
+    if proc.returncode != 0:
+        raise ln.ToolError(f"legatto-policy apply failed (exit {proc.returncode}): {proc.stderr.strip()[-300:]}")
+    return json.loads(proc.stdout or "{}")
+
+
+# --- commands -------------------------------------------------------------------------------
+
+def cmd_enroll(args: argparse.Namespace) -> dict:
+    actor = ln.parse_actor(args.actor)
+    server = login_server()
+    with ln.FileLock(LOCK):
+        if args.kind == "staff":
+            if not args.login or not ln.STAFF_RE.match(args.login):
+                raise ln.ToolError("--login is required for --kind staff", ln.EXIT_ARGS)
+            if args.login not in load_staff():
+                raise ln.ToolError(f"{args.login} is not on the staff list", EXIT_MISSING)
+            user_id = ensure_user(args.login, ln.headscale_users())
+            key = create_key(["--user", user_id])
+            user, tags = args.login, []
+        else:
+            if args.login:
+                raise ln.ToolError("--login is only valid for --kind staff", ln.EXIT_ARGS)
+            key = create_key(["--tags", ln.TAG_OFFICE])
+            user, tags = None, [ln.TAG_OFFICE]
+        ln.audit("device", "device.enroll", actor, {"kind": args.kind, "user": user, "tags": tags,
+                                                    "expires_at": key["expires_at"]})
+    return {"kind": args.kind, "user": user, "tags": tags, "key": key["key"], "expires_at": key["expires_at"],
+            "login_server": server}
+
+
+def cmd_vendor_key(args: argparse.Namespace) -> dict:
+    actor = ln.parse_actor(args.actor)
+    if not ln.VENDOR_RE.match(args.login):
+        raise ln.ToolError("--login must be a v-<name> account", ln.EXIT_ARGS)
+    server = login_server()
+    with ln.FileLock(LOCK):
+        users = ln.headscale_users()
+        if args.login not in users:
+            raise ln.ToolError(f"vendor {args.login} has no Headscale user (vendors-set first)", EXIT_MISSING)
+        key = create_key(["--user", users[args.login]])
+        ln.audit("device", "device.enroll", actor, {"kind": "vendor", "user": args.login, "tags": [],
+                                                    "expires_at": key["expires_at"]})
+    return {"kind": "vendor", "user": args.login, "tags": [], "key": key["key"],
+            "expires_at": key["expires_at"], "login_server": server}
+
+
+def cmd_revoke(args: argparse.Namespace) -> dict:
+    actor = ln.parse_actor(args.actor)
+    if not args.node_id.isdigit():
+        raise ln.ToolError("--node-id must be numeric", ln.EXIT_ARGS)
+    with ln.FileLock(LOCK):
+        node = next((n for n in ln.headscale_nodes() if n["id"] == args.node_id), None)
+        if node is None:
+            raise ln.ToolError(f"node {args.node_id} does not exist", EXIT_MISSING)
+        if ln.TAG_SERVER in node["tags"]:
+            raise ln.ToolError("the server node cannot be revoked from the console", ln.EXIT_ARGS)
+        delete_node(node)
+        ln.audit("device", "device.revoke", actor, {"node_id": node["id"], "name": node["name"],
+                                                    "user": node["user"], "tags": node["tags"]})
+    return {"node_id": node["id"], "name": node["name"]}
+
+
+def cmd_staff_set(args: argparse.Namespace) -> dict:
+    actor = ln.parse_actor(args.actor)
+    staff = read_list_file(args.file, "staff", ln.STAFF_RE)
+    vendor_like = [s for s in staff if ln.VENDOR_RE.match(s) or s.startswith("v-")]
+    if vendor_like:
+        raise ln.ToolError(f"staff logins may not start with v-: {vendor_like}", ln.EXIT_ARGS)
+    with ln.FileLock(LOCK):
+        previous = load_staff()
+        added = sorted(set(staff) - set(previous))
+        removed = sorted(set(previous) - set(staff))
+        users = ln.headscale_users()
+        for login in added:
+            ensure_user(login, users)
+        ln.write_json(STAFF_FILE, {"v": 1, "staff": staff, "updated_at": ln.fmt_ts(ln.now())},
+                      0o640, ln.CONSOLE_GROUP)
+        deleted = remove_users([u for u in removed if u in users], actor)
+        if added or removed:
+            ln.audit("device", "device.staff_set", actor, {"added": added, "removed": removed,
+                                                           "nodes_deleted": deleted})
+        policy = apply_policy(actor)
+    return {"staff": staff, "added": added, "removed": removed, "nodes_deleted": deleted, "policy": policy}
+
+
+def cmd_vendors_set(args: argparse.Namespace) -> dict:
+    actor = ln.parse_actor(args.actor)
+    vendors = read_list_file(args.file, "vendors", ln.VENDOR_RE)
+    with ln.FileLock(LOCK):
+        users = ln.headscale_users()
+        created = [v for v in vendors if v not in users]
+        for login in created:
+            ensure_user(login, users)
+        stale = sorted(u for u in users if u.startswith("v-") and u not in vendors)
+        deleted = remove_users(stale, actor)
+        if created or stale:
+            ln.audit("device", "device.vendors_set", actor, {"created": created, "removed": stale,
+                                                             "nodes_deleted": deleted})
+    return {"vendors": vendors, "created": created, "removed": stale, "nodes_deleted": deleted}
+
+
+def cmd_nodes(_args: argparse.Namespace) -> dict:
+    nodes = []
+    for node in ln.headscale_nodes():
+        nodes.append({k: node[k] for k in ("id", "name", "user", "tags", "ip4", "ip6", "online", "last_seen",
+                                            "expiry")})
+    nodes.sort(key=lambda n: int(n["id"]) if n["id"].isdigit() else 0)
+    return {"nodes": nodes}
+
+
+def build_parser() -> argparse.ArgumentParser:
+    parser = argparse.ArgumentParser(prog="legatto-tailnet", description="tailnet membership")
+    sub = parser.add_subparsers(dest="cmd", required=True)
+    p = sub.add_parser("enroll")
+    p.add_argument("--kind", choices=("staff", "office-device"), required=True)
+    p.add_argument("--login", default=None)
+    p.add_argument("--actor", required=True)
+    p.add_argument("--json", action="store_true")
+    p = sub.add_parser("revoke")
+    p.add_argument("--node-id", required=True)
+    p.add_argument("--actor", required=True)
+    p.add_argument("--json", action="store_true")
+    p = sub.add_parser("staff-set")
+    p.add_argument("--file", required=True)
+    p.add_argument("--actor", required=True)
+    p.add_argument("--json", action="store_true")
+    p = sub.add_parser("nodes")
+    p.add_argument("--json", action="store_true")
+    p = sub.add_parser("vendors-set")
+    p.add_argument("--file", required=True)
+    p.add_argument("--actor", required=True)
+    p.add_argument("--json", action="store_true")
+    p = sub.add_parser("vendor-key")
+    p.add_argument("--login", required=True)
+    p.add_argument("--actor", required=True)
+    p.add_argument("--json", action="store_true")
+    return parser
+
+
+def main(argv: list) -> int:
+    try:
+        args = build_parser().parse_args(argv)
+    except SystemExit as exc:
+        return ln.EXIT_ARGS if exc.code else ln.EXIT_OK
+    handlers = {"enroll": cmd_enroll, "revoke": cmd_revoke, "staff-set": cmd_staff_set, "nodes": cmd_nodes,
+                "vendors-set": cmd_vendors_set, "vendor-key": cmd_vendor_key}
+    try:
+        ln.require_root()
+        result = handlers[args.cmd](args)
+    except ln.ToolError as exc:
+        ln.warn(str(exc))
+        return exc.code
+    except OSError as exc:
+        ln.warn(str(exc))
+        return ln.EXIT_ERR
+    text = json.dumps(result, sort_keys=True, ensure_ascii=False)
+    if args.json:
+        print(text)
+    elif args.cmd in ("enroll", "vendor-key"):
+        # Without --json the key is still the only useful output; print it alone.
+        print(result["key"])
+    else:
+        print(text, file=sys.stderr)
+    return ln.EXIT_OK
+
+
+if __name__ == "__main__":
+    sys.exit(main(sys.argv[1:]))

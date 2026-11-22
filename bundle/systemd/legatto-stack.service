@@ -1,0 +1,20 @@
+# Legatto application stack: docker compose project "legatto" from
+# /opt/legatto/current/compose (upstream Supabase copy + docker-compose.legatto.yml).
+# Release-delivered (applier systemd-unit); runs only the Ansible-installed tool.
+# No ExecStop: stopping this unit must not stop the database. Updates use
+# `systemctl reload` (idempotent `docker compose up -d --remove-orphans --wait`).
+[Unit]
+Description=Legatto application stack (docker compose project legatto)
+Requires=docker.service legatto-secrets-render.service
+After=docker.service legatto-secrets-render.service network-online.target
+Wants=network-online.target
+
+[Service]
+Type=oneshot
+RemainAfterExit=yes
+ExecStart=/opt/legatto/sbin/legatto-stack up
+ExecReload=/opt/legatto/sbin/legatto-stack up
+TimeoutStartSec=15min
+
+[Install]
+WantedBy=multi-user.target

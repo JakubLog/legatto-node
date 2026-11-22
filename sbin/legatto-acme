@@ -1,0 +1,247 @@
+#!/usr/bin/python3
+"""legatto-acme — office TLS certificate via lego DNS-01 (lane platform, role proxy).
+
+Runs only from legatto-acme.service:
+  renew    (User=legatto-acme) lego run: obtain or renew app.<domain> + *.app.<domain>;
+           the Cloudflare token arrives as systemd credential legatto-cf-dns-token
+  install  (root, ExecStartPost=+) copy a new certificate to /etc/caddy/certs (root:caddy 0640)
+           after checking that key and certificate match, then reload Caddy
+  status   (root, ExecStopPost=+) write /var/lib/legatto/status/tls.json (contract §4.4)
+
+Exit codes: 0 ok, 1 unexpected error, 2 bad arguments, 4 precondition, 20 lego failed,
+21 renewed certificate rejected (key mismatch, wrong names).
+"""
+
+import argparse
+import datetime
+import grp
+import json
+import os
+import subprocess
+import sys
+import tempfile
+
+# contract: legatto_paths.acme_state
+STATE_DIR = "/var/lib/legatto-acme"
+# contract: legatto_paths.bin_current
+BIN_CURRENT = "/opt/legatto/bin/current"
+# contract: legatto_paths.caddy_cert
+CADDY_CERT = "/etc/caddy/certs/app.crt"
+# contract: legatto_paths.caddy_key
+CADDY_KEY = "/etc/caddy/certs/app.key"
+# contract: legatto_paths.status
+STATUS_DIR = "/var/lib/legatto/status"
+# contract: legatto_groups.status
+STATUS_GROUP = "legatto-status"
+# contract: legatto_users.caddy
+CADDY_GROUP = "caddy"
+# contract: legatto_units.caddy
+CADDY_UNIT = "legatto-caddy.service"
+# Embedded name = credential ID; systemd finds it in /etc/credstore.encrypted.
+# contract: legatto_credentials.cf_dns_token
+CF_DNS_CREDENTIAL = "legatto-cf-dns-token"
+CERT_NAME = "app"
+# Local resolver only (systemd-resolved, DoT upstream): no queries to authoritative servers.
+RESOLVER = "127.0.0.53:53"
+OPENSSL = "/usr/bin/openssl"
+
+
+class Fail(Exception):
+    def __init__(self, code, message):
+        super().__init__(message)
+        self.code = code
+
+
+def log(msg):
+    print("legatto-acme: " + msg, file=sys.stderr, flush=True)
+
+
+def utc(ts=None):
+    dt = datetime.datetime.now(datetime.timezone.utc) if ts is None else ts
+    return dt.strftime("%Y-%m-%dT%H:%M:%SZ")
+
+
+def lego_paths():
+    base = os.path.join(STATE_DIR, "certificates")
+    return os.path.join(base, CERT_NAME + ".crt"), os.path.join(base, CERT_NAME + ".key")
+
+
+def cmd_renew(_args):
+    domains = [d for d in os.environ.get("LEGATTO_ACME_DOMAINS", "").split(",") if d]
+    email = os.environ.get("LEGATTO_ACME_EMAIL", "")
+    server = os.environ.get("LEGATTO_ACME_SERVER", "")
+    creds = os.environ.get("CREDENTIALS_DIRECTORY", "")
+    if not domains or not email or not server:
+        raise Fail(4, "LEGATTO_ACME_DOMAINS/EMAIL/SERVER missing (run through legatto-acme.service)")
+    token_file = os.path.join(creds, CF_DNS_CREDENTIAL)
+    if not creds or not os.path.isfile(token_file):
+        raise Fail(4, "credential %s missing" % CF_DNS_CREDENTIAL)
+    argv = [os.path.join(BIN_CURRENT, "lego"), "--log.format", "text", "run",
+            "--accept-tos", "--email", email, "--server", server,
+            "--path", STATE_DIR, "--cert.name", CERT_NAME, "--key-type", "EC256",
+            "--dns", "cloudflare", "--dns.resolvers", RESOLVER, "--dns.propagation.disable-ans",
+            "--force-cert-domains", "--no-random-sleep"]
+    for domain in domains:
+        argv += ["--domains", domain]
+    env = {k: v for k, v in os.environ.items()
+           if k in ("PATH", "HOME", "HTTPS_PROXY", "HTTP_PROXY", "NO_PROXY", "CREDENTIALS_DIRECTORY")
+           or k.startswith("CLOUDFLARE_")}
+    # lego reads <VAR>_FILE: the token never appears in argv or in the environment.
+    env["CF_DNS_API_TOKEN_FILE"] = token_file
+    env["CF_ZONE_API_TOKEN_FILE"] = token_file
+    proc = subprocess.run(argv, env=env)
+    if proc.returncode != 0:
+        raise Fail(20, "lego exited with %d" % proc.returncode)
+    return 0
+
+
+def openssl(*args, data=None):
+    proc = subprocess.run([OPENSSL] + list(args), input=data, capture_output=True)
+    if proc.returncode != 0:
+        raise Fail(21, "openssl %s failed" % args[0])
+    return proc.stdout
+
+
+def cert_info(path):
+    out = openssl("x509", "-in", path, "-noout", "-enddate", "-subject", "-issuer", "-ext", "subjectAltName",
+                  "-nameopt", "RFC2253").decode("utf-8", "replace")
+    info = {"names": []}
+    for line in out.splitlines():
+        line = line.strip()
+        if line.startswith("notAfter="):
+            info["not_after"] = datetime.datetime.strptime(line[9:], "%b %d %H:%M:%S %Y %Z").replace(
+                tzinfo=datetime.timezone.utc)
+        elif line.startswith("subject="):
+            info["subject"] = line[8:]
+        elif line.startswith("issuer="):
+            info["issuer"] = line[7:]
+        elif "DNS:" in line:
+            info["names"] = [p.strip()[4:] for p in line.split(",") if p.strip().startswith("DNS:")]
+    return info
+
+
+def public_key(path, kind):
+    return openssl(kind, "-in", path, "-pubout") if kind == "pkey" else openssl("x509", "-in", path, "-noout",
+                                                                                  "-pubkey")
+
+
+def atomic_copy(src, dst, gid):
+    with open(src, "rb") as fh:
+        data = fh.read()
+    fd, tmp = tempfile.mkstemp(prefix=".tmp-", dir=os.path.dirname(dst))
+    try:
+        os.fchown(fd, 0, gid)
+        os.fchmod(fd, 0o640)
+        os.write(fd, data)
+        os.fsync(fd)
+        os.close(fd)
+        fd = -1
+        os.replace(tmp, dst)
+    finally:
+        if fd >= 0:
+            os.close(fd)
+        if os.path.exists(tmp):
+            os.unlink(tmp)
+
+
+def same_file(a, b):
+    try:
+        with open(a, "rb") as fa, open(b, "rb") as fb:
+            return fa.read() == fb.read()
+    except FileNotFoundError:
+        return False
+
+
+def cmd_install(_args):
+    if os.geteuid() != 0:
+        raise Fail(4, "install must run as root")
+    crt, key = lego_paths()
+    if not os.path.isfile(crt) or not os.path.isfile(key):
+        raise Fail(4, "lego produced no certificate in " + os.path.dirname(crt))
+    if same_file(crt, CADDY_CERT) and same_file(key, CADDY_KEY):
+        log("certificate unchanged")
+        return 0
+    if public_key(crt, "x509") != public_key(key, "pkey"):
+        raise Fail(21, "renewed certificate does not match its key")
+    wanted = [d for d in os.environ.get("LEGATTO_ACME_DOMAINS", "").split(",") if d]
+    names = cert_info(crt)["names"]
+    if sorted(wanted) != sorted(names):
+        raise Fail(21, "renewed certificate names %s differ from %s" % (names, wanted))
+    gid = grp.getgrnam(CADDY_GROUP).gr_gid
+    # Key first: a reload between the two copies would otherwise pair a new cert with the old key.
+    atomic_copy(key, CADDY_KEY, gid)
+    atomic_copy(crt, CADDY_CERT, gid)
+    if subprocess.run(["systemctl", "is-active", "--quiet", CADDY_UNIT]).returncode == 0:
+        subprocess.run(["systemctl", "reload", CADDY_UNIT], check=True)
+    log("installed certificate valid until %s" % utc(cert_info(CADDY_CERT)["not_after"]))
+    return 0
+
+
+def previous_status(path):
+    try:
+        with open(path, "r", encoding="utf-8") as fh:
+            return json.load(fh)
+    except (FileNotFoundError, json.JSONDecodeError):
+        return {}
+
+
+def cmd_status(_args):
+    if os.geteuid() != 0:
+        raise Fail(4, "status must run as root")
+    path = os.path.join(STATUS_DIR, "tls.json")
+    prev = previous_status(path)
+    min_days = int(os.environ.get("LEGATTO_TLS_MIN_DAYS", "14"))
+    service_ok = os.environ.get("SERVICE_RESULT", "success") == "success"
+    doc = {"v": 1, "component": "tls", "ts": utc()}
+    try:
+        info = cert_info(CADDY_CERT)
+        days_left = int((info["not_after"] - datetime.datetime.now(datetime.timezone.utc)).total_seconds() // 86400)
+        self_signed = info.get("subject") == info.get("issuer")
+        doc["not_after"] = utc(info["not_after"])
+        doc["days_left"] = max(days_left, 0)
+        mtime = datetime.datetime.fromtimestamp(os.stat(CADDY_CERT).st_mtime, datetime.timezone.utc)
+        doc["last_renew_at"] = None if self_signed else utc(mtime)
+        ok = service_ok and not self_signed and days_left >= min_days
+    except (Fail, FileNotFoundError, KeyError):
+        doc.update({"not_after": None, "days_left": 0, "last_renew_at": prev.get("last_renew_at")})
+        ok = False
+    doc["state"] = "ok" if ok else "fail"
+    doc["ok"] = ok
+    gid = grp.getgrnam(STATUS_GROUP).gr_gid
+    fd, tmp = tempfile.mkstemp(prefix=".tls-", dir=STATUS_DIR)
+    try:
+        os.fchown(fd, 0, gid)
+        os.fchmod(fd, 0o640)
+        os.write(fd, (json.dumps(doc, sort_keys=True) + "\n").encode("utf-8"))
+        os.fsync(fd)
+        os.close(fd)
+        fd = -1
+        os.replace(tmp, path)
+    finally:
+        if fd >= 0:
+            os.close(fd)
+        if os.path.exists(tmp):
+            os.unlink(tmp)
+    log("tls.json: state=%s days_left=%s" % (doc["state"], doc["days_left"]))
+    return 0
+
+
+def main(argv=None):
+    parser = argparse.ArgumentParser(prog="legatto-acme", description=__doc__.split("\n")[0])
+    parser.add_argument("cmd", choices=("renew", "install", "status"))
+    try:
+        args = parser.parse_args(argv)
+    except SystemExit as exc:
+        return 2 if exc.code else 0
+    try:
+        return {"renew": cmd_renew, "install": cmd_install, "status": cmd_status}[args.cmd](args)
+    except Fail as exc:
+        log(str(exc))
+        return exc.code
+    except (OSError, KeyError, ValueError, subprocess.CalledProcessError) as exc:
+        log("error: %s: %s" % (exc.__class__.__name__, exc))
+        return 1
+
+
+if __name__ == "__main__":
+    sys.exit(main())

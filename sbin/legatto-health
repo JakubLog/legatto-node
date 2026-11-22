@@ -1,0 +1,640 @@
+#!/usr/bin/python3
+"""legatto-health — status of one office server for Uptime Kuma (no PII).
+
+    legatto-health collect [--json]   root: build the payload, write status/health.json
+    legatto-health push               legatto-mon: send status/health.json to Kuma
+    legatto-health --dry-run          print the Kuma payload, write nothing
+
+The Kuma `msg` is assembled only from the fixed key allowlist below
+(contract: legatto_kuma_fields). Each value is read from a typed source and
+must fully match its expression; anything else becomes `ERR`. Log content is
+never read: the error counter asks journald for the number of entries only
+(`--output-fields` without MESSAGE). There is no free-text path from the
+server into the payload.
+
+Exit codes (CONTRACT §4.6): 0 ok, 1 unexpected error, 2 bad arguments,
+3 lock busy, 4 precondition (not root, missing configuration),
+10 push failed (network/HTTP/Kuma), 11 health.json missing, invalid or stale.
+"""
+
+from __future__ import annotations
+
+import argparse
+import fcntl
+import json
+import os
+import re
+import subprocess
+import sys
+import tempfile
+import time
+import urllib.error
+import urllib.parse
+import urllib.request
+from datetime import datetime, timezone
+
+# Test hook: every absolute path is resolved under LEGATTO_ROOT (empty on servers).
+ROOT = os.environ.get("LEGATTO_ROOT", "")
+
+STATUS_DIR = "/var/lib/legatto/status"            # contract: legatto_paths.status
+UPDATE_POLICY = "/etc/legatto/update/policy.json"  # contract: legatto_paths.update_policy
+OPS_CONF = "/etc/legatto/ops.json"                 # contract: legatto_paths.ops_conf
+RUN_DIR = "/run/legatto"                           # contract: legatto_paths.run
+EGRESS_PROXY = "http://127.0.0.1:4750"             # contract: legatto_egress_proxy_url_host
+STATUS_GROUP = "legatto-status"                    # contract: legatto_groups.status
+COMPOSE_PROJECT = "legatto"                        # contract: legatto_compose_project
+# contract: legatto_compose_services
+COMPOSE_SERVICES = ("db", "auth", "rest", "realtime", "storage", "functions", "api-gw", "app", "meta", "studio",
+                    "egress-app", "egress-auth", "egress-fn", "egress-intake", "egress-publish")
+# Services of the compose profile `admin` (contract: legatto_compose_profile_admin), expected only when present.
+ON_DEMAND_SERVICES = ("meta", "studio")
+ERROR_COUNT_SERVICES = ("app", "functions")
+CREDENTIAL_NAME = "kuma-push-token"                # LoadCredentialEncrypted= name in legatto-health.service
+INTERVAL_SECONDS = 300                             # contract: legatto_kuma_interval (5min)
+STALE_SECONDS = 3 * INTERVAL_SECONDS
+MAX_STATUS_BYTES = 256 * 1024
+
+_NUM7 = r"^[0-9]{1,7}$"
+_SERVICE_LIST = r"^(?:(?:%s)(?:,(?:%s))*)?$" % ("|".join(map(re.escape, COMPOSE_SERVICES)),
+                                                  "|".join(map(re.escape, COMPOSE_SERVICES)))
+# contract: legatto_kuma_fields (order) + CONTRACT.md §4.5 (expressions)
+KUMA_FIELDS = (
+    ("v", r"^[0-9]+\.[0-9]+\.[0-9]+(-[0-9A-Za-z.-]+)?$"),
+    ("ch", r"^(canary|early|stable)$"),
+    ("sig", r"^(ok|bad|none)$"),
+    ("chk_age", r"^[0-9]{1,8}$"),
+    ("upd", r"^(ok|pending|waiting|installing|failed|rb|rej|vuln|stale|blocked-baseline|optout)$"),
+    ("disk", r"^[0-9]{1,3}$"),
+    ("ram", r"^[0-9]{1,3}$"),
+    ("bk", r"^(ok|fail|run|none)$"),
+    ("bk_age", r"^[0-9]{1,5}h$"),
+    ("rt", r"^(ok|fail|none)/[0-9]{1,4}d$"),
+    ("err", r"^[0-9]{1,6}$"),
+    ("ct", r"^[0-9]{1,2}/[0-9]{1,2}$"),
+    ("ctbad", _SERVICE_LIST),
+    ("bg", r"^[01]$"),
+    ("aseq", r"^[0-9]{1,9}$"),
+    ("ahead", r"^[0-9a-f]{16}$"),
+    ("cert", r"^[0-9]{1,3}$"),
+    ("egress", r"^(observe|enforce)$"),
+    ("eg_deny", r"^[0-9]{1,6}$"),
+    ("in_age", _NUM7),
+    ("in_q", _NUM7),
+    ("in_fail", _NUM7),
+    ("pub_age", _NUM7),
+)
+FIELD_RE = {key: re.compile(expr) for key, expr in KUMA_FIELDS}
+ERR = "ERR"
+
+UPD_DOWN = {"failed", "rb", "rej", "vuln", "stale"}
+CHK_AGE_MAX = 86400
+BK_AGE_MAX_H = 26
+DISK_MAX = 90
+IN_AGE_MAX = 900
+CERT_MIN_DAYS = 14
+# Reason codes stored in health.json (fixed set, never free text).
+REASONS = ("sig", "upd", "chk_age", "containers", "backup", "disk", "intake", "cert", "audit")
+
+KUMA_HOST_RE = re.compile(r"^(?=.{1,253}$)[a-z0-9]([a-z0-9-]{0,61}[a-z0-9])?(\.[a-z0-9]([a-z0-9-]{0,61}[a-z0-9])?)+$")
+TOKEN_RE = re.compile(r"^[A-Za-z0-9_-]{8,128}$")
+TS_RE = re.compile(r"^[0-9]{4}-[0-9]{2}-[0-9]{2}T[0-9]{2}:[0-9]{2}:[0-9]{2}Z$")
+
+
+class Failure(Exception):
+    def __init__(self, code: int, message: str):
+        super().__init__(message)
+        self.code = code
+
+
+def path(p: str) -> str:
+    return ROOT + p
+
+
+def log(message: str) -> None:
+    print(f"legatto-health: {message}", file=sys.stderr)
+
+
+def utc_now() -> datetime:
+    return datetime.now(timezone.utc).replace(microsecond=0)
+
+
+def fmt_ts(dt: datetime) -> str:
+    return dt.strftime("%Y-%m-%dT%H:%M:%SZ")
+
+
+def parse_ts(value: object) -> datetime | None:
+    if not isinstance(value, str) or not TS_RE.match(value):
+        return None
+    try:
+        return datetime.strptime(value, "%Y-%m-%dT%H:%M:%SZ").replace(tzinfo=timezone.utc)
+    except ValueError:
+        return None
+
+
+def age_seconds(value: object, now: datetime) -> int | None:
+    ts = parse_ts(value)
+    if ts is None:
+        return None
+    return max(0, int((now - ts).total_seconds()))
+
+
+def read_json(p: str) -> dict | None:
+    """Small JSON object from a root-owned file; None when absent or unusable."""
+    try:
+        fd = os.open(path(p), os.O_RDONLY | os.O_NOFOLLOW | os.O_CLOEXEC)
+    except OSError:
+        return None
+    try:
+        with os.fdopen(fd, "rb") as fh:
+            raw = fh.read(MAX_STATUS_BYTES + 1)
+    except OSError:
+        return None
+    if len(raw) > MAX_STATUS_BYTES:
+        return None
+    try:
+        data = json.loads(raw.decode("utf-8"))
+    except (UnicodeDecodeError, ValueError):
+        return None
+    return data if isinstance(data, dict) else None
+
+
+def status_file(component: str) -> dict | None:
+    data = read_json(f"{STATUS_DIR}/{component}.json")
+    if data is None or data.get("component") != component:
+        return None
+    return data
+
+
+def as_int(value: object) -> int | None:
+    if isinstance(value, bool) or not isinstance(value, int):
+        return None
+    return value
+
+
+def run(cmd: list[str]) -> subprocess.Popen | None:
+    """Start a source command; None when it cannot start (missing binary): the field becomes ERR."""
+    try:
+        return subprocess.Popen(cmd, stdout=subprocess.PIPE, stderr=subprocess.DEVNULL, stdin=subprocess.DEVNULL,
+                                env={"PATH": os.environ.get("PATH", "/usr/sbin:/usr/bin:/sbin:/bin"), "LC_ALL": "C"})
+    except OSError:
+        return None
+
+
+# --- sources ---------------------------------------------------------------------------
+
+def compose_containers() -> list[dict] | None:
+    """Containers of the compose project: service, name, state, health. None if docker fails."""
+    fmt = ('{{.Label "com.docker.compose.service"}}\t{{.Label "com.docker.compose.oneoff"}}\t'
+           '{{.Names}}\t{{.State}}\t{{.Status}}')
+    proc = run(["docker", "ps", "-a", "--no-trunc", "--filter", f"label=com.docker.compose.project={COMPOSE_PROJECT}",
+                "--format", fmt])
+    if proc is None:
+        return None
+    try:
+        out, _ = proc.communicate(timeout=30)
+    except subprocess.TimeoutExpired:
+        proc.kill()
+        proc.communicate()
+        return None
+    if proc.returncode != 0:
+        return None
+    result = []
+    for line in out.decode("utf-8", "replace").splitlines():
+        parts = line.split("\t")
+        if len(parts) != 5:
+            continue
+        service, oneoff, name, state, status = parts
+        if oneoff.lower() == "true" or service not in COMPOSE_SERVICES:
+            continue
+        if "(unhealthy)" in status:
+            health = "unhealthy"
+        elif "(health: starting)" in status:
+            health = "starting"
+        elif "(healthy)" in status:
+            health = "healthy"
+        else:
+            health = "none"
+        result.append({"service": service, "name": name, "state": state, "health": health})
+    return result
+
+
+def container_fields(containers: list[dict] | None) -> tuple[str, str]:
+    if containers is None:
+        return ERR, ERR
+    by_service: dict[str, list[dict]] = {}
+    for item in containers:
+        by_service.setdefault(item["service"], []).append(item)
+    expected = [s for s in COMPOSE_SERVICES if s not in ON_DEMAND_SERVICES or s in by_service]
+    bad = []
+    for service in expected:
+        items = by_service.get(service, [])
+        good = any(i["state"] == "running" and i["health"] in ("healthy", "none") for i in items)
+        if not good:
+            bad.append(service)
+    return f"{len(expected) - len(bad)}/{len(expected)}", ",".join(bad)
+
+
+def error_count(containers: list[dict] | None, now: datetime) -> str:
+    """Number of journald entries with priority 0..3 from app/functions in the last interval."""
+    if containers is None:
+        return ERR
+    names = sorted({i["name"] for i in containers if i["service"] in ERROR_COUNT_SERVICES})
+    if not names:
+        return "0"
+    since = int(now.timestamp()) - INTERVAL_SECONDS
+    cmd = ["journalctl", "--no-pager", "--quiet", "--priority=0..3", f"--since=@{since}",
+           "--output=json", "--output-fields=PRIORITY"]
+    cmd += [f"CONTAINER_NAME={name}" for name in names]
+    proc = run(cmd)
+    if proc is None:
+        return ERR
+    count = 0
+    assert proc.stdout is not None
+    deadline = time.monotonic() + 30
+    for _ in proc.stdout:
+        count += 1
+        if time.monotonic() > deadline:
+            proc.kill()
+            break
+    proc.stdout.close()
+    if proc.wait() != 0:
+        return ERR
+    return str(min(count, 999999))
+
+
+def disk_percent() -> str:
+    worst = None
+    for mount in ("/", "/var/lib/docker"):
+        try:
+            st = os.statvfs(path(mount))
+        except OSError:
+            continue
+        if st.f_blocks == 0:
+            continue
+        used = st.f_blocks - st.f_bfree
+        usable = used + st.f_bavail
+        pct = (used * 100 + usable - 1) // usable if usable else 100
+        worst = pct if worst is None else max(worst, pct)
+    return ERR if worst is None else str(worst)
+
+
+def ram_percent() -> str:
+    info = {}
+    try:
+        with open(path("/proc/meminfo"), encoding="ascii") as fh:
+            for line in fh:
+                key, _, rest = line.partition(":")
+                fields = rest.split()
+                if fields and fields[0].isdigit():
+                    info[key] = int(fields[0])
+    except OSError:
+        return ERR
+    total, avail = info.get("MemTotal"), info.get("MemAvailable")
+    if not total or avail is None:
+        return ERR
+    return str(max(0, min(100, round((total - avail) * 100 / total))))
+
+
+# --- payload ---------------------------------------------------------------------------
+
+def gather(now: datetime) -> dict[str, str | None]:
+    """Raw values per key. None = source not installed (key omitted)."""
+    raw: dict[str, str | None] = {key: None for key, _ in KUMA_FIELDS}
+
+    update = status_file("update")
+    policy = read_json(UPDATE_POLICY)
+    if update is None:
+        for key in ("sig", "chk_age", "upd"):
+            raw[key] = ERR  # fail closed: the updater always exists on a server
+    else:
+        installed = update.get("installed")
+        if isinstance(installed, dict) and installed.get("version") is not None:
+            raw["v"] = str(installed.get("version"))
+        raw["sig"] = str(update.get("sig"))
+        raw["upd"] = str(update.get("upd"))
+        last = update.get("last_check")
+        age = age_seconds(last.get("ok_ts"), now) if isinstance(last, dict) else None
+        raw["chk_age"] = ERR if age is None else str(age)
+    channel = policy.get("channel") if policy else (update or {}).get("channel")
+    if channel is not None:
+        raw["ch"] = str(channel)
+
+    raw["disk"] = disk_percent()
+    raw["ram"] = ram_percent()
+
+    backup = status_file("backup")
+    if backup is None:
+        raw["bk"], raw["bk_age"] = "none", ERR
+    else:
+        pg = backup.get("pgdump") if isinstance(backup.get("pgdump"), dict) else {}
+        state = pg.get("state")
+        if not backup.get("hetzner_window"):
+            raw["bk"] = "none"  # the Hetzner backup is the only backup (U4); not declared = no backup
+        else:
+            raw["bk"] = str(state) if state in ("ok", "fail", "run") else "none"
+        age = age_seconds(pg.get("last_ok_at"), now)
+        raw["bk_age"] = ERR if age is None else f"{age // 3600}h"
+
+    rtest = status_file("restore-test")
+    if rtest is None:
+        raw["rt"] = "none/0d"
+    else:
+        age = age_seconds(rtest.get("last_run_at"), now)
+        state = rtest.get("state")
+        raw["rt"] = "none/0d" if state == "none" else f"{state}/{ERR if age is None else age // 86400}d"
+
+    containers = compose_containers()
+    raw["ct"], raw["ctbad"] = container_fields(containers)
+    raw["err"] = error_count(containers, now)
+
+    breakglass = status_file("breakglass")
+    if breakglass is not None:
+        active = breakglass.get("active")
+        raw["bg"] = "1" if active is True else "0" if active is False else ERR
+
+    audit = status_file("audit")
+    if audit is None:
+        raw["aseq"], raw["ahead"] = ERR, ERR
+    else:
+        seq = as_int(audit.get("seq"))
+        raw["aseq"] = ERR if seq is None else str(seq)
+        head = audit.get("head")
+        raw["ahead"] = head[:16] if isinstance(head, str) and len(head) == 64 else ERR
+
+    tls = status_file("tls")
+    if tls is not None:
+        days = as_int(tls.get("days_left"))
+        raw["cert"] = ERR if days is None else str(max(0, days))
+
+    egress = status_file("egress")
+    if egress is not None:
+        raw["egress"] = str(egress.get("mode"))
+        denied = as_int(egress.get("denied_5m"))
+        raw["eg_deny"] = ERR if denied is None else str(denied)
+
+    intake = status_file("intake")
+    if intake is not None:
+        age = age_seconds(intake.get("last_ok_at"), now)
+        raw["in_age"] = ERR if age is None else str(age)
+        for key, src in (("in_q", "backlog"), ("in_fail", "failed")):
+            value = as_int(intake.get(src))
+            raw[key] = ERR if value is None else str(value)
+    publish = status_file("publish")
+    if publish is not None:
+        age = age_seconds(publish.get("last_ok_at"), now)
+        raw["pub_age"] = ERR if age is None else str(age)
+
+    raw["_audit_ok"] = "1" if audit is not None and audit.get("chain_ok") is True else "0"
+    return raw
+
+
+def sanitize(raw: dict[str, str | None]) -> dict[str, str]:
+    """Allowlist + expressions: the only way a value reaches the payload."""
+    fields: dict[str, str] = {}
+    for key, _ in KUMA_FIELDS:
+        value = raw.get(key)
+        if value is None:
+            continue
+        fields[key] = value if FIELD_RE[key].fullmatch(value) else ERR
+    return fields
+
+
+def _num(fields: dict[str, str], key: str) -> int | None:
+    value = fields.get(key)
+    if value is None or value == ERR:
+        return None
+    digits = value.rstrip("h")
+    return int(digits) if digits.isdigit() else None
+
+
+def down_reasons(fields: dict[str, str], audit_ok: bool) -> list[str]:
+    reasons = []
+    if fields.get("sig") in ("bad", ERR):
+        reasons.append("sig")
+    if fields.get("upd") in UPD_DOWN or fields.get("upd") == ERR:
+        reasons.append("upd")
+    chk = _num(fields, "chk_age")
+    if chk is None or chk > CHK_AGE_MAX:
+        reasons.append("chk_age")
+    if fields.get("ct") in (None, ERR) or fields.get("ctbad") not in ("",):
+        reasons.append("containers")
+    bk_age = _num(fields, "bk_age")
+    if fields.get("bk") == "none" or bk_age is None or bk_age > BK_AGE_MAX_H:
+        reasons.append("backup")
+    disk = _num(fields, "disk")
+    if disk is None or disk > DISK_MAX:
+        reasons.append("disk")
+    in_age = _num(fields, "in_age")
+    if in_age is not None and in_age > IN_AGE_MAX:
+        reasons.append("intake")
+    cert = _num(fields, "cert")
+    if cert is not None and cert < CERT_MIN_DAYS:
+        reasons.append("cert")
+    if not audit_ok:
+        reasons.append("audit")
+    return reasons
+
+
+def build_msg(fields: dict[str, str]) -> str:
+    parts = []
+    for key, _ in KUMA_FIELDS:
+        if key in fields:
+            value = fields[key]
+            if value != ERR and not FIELD_RE[key].fullmatch(value):
+                raise Failure(1, f"internal: value of {key} escaped validation")
+            parts.append(f"{key}={value}")
+    return " ".join(parts)
+
+
+def build_health(now: datetime) -> dict:
+    raw = gather(now)
+    fields = sanitize(raw)
+    reasons = down_reasons(fields, raw.get("_audit_ok") == "1")
+    status = "down" if reasons else "up"
+    return {"v": 1, "component": "health", "ts": fmt_ts(now), "ok": status == "up", "status": status,
+            "msg": build_msg(fields), "fields": fields, "reasons": reasons}
+
+
+def parse_msg(msg: object) -> dict[str, str] | None:
+    """Re-validate a stored msg token by token; None if anything is outside the allowlist."""
+    if not isinstance(msg, str) or len(msg) > 1024:
+        return None
+    fields: dict[str, str] = {}
+    order = [key for key, _ in KUMA_FIELDS]
+    last = -1
+    for token in msg.split(" ") if msg else []:
+        key, sep, value = token.partition("=")
+        if not sep or key not in FIELD_RE or key in fields:
+            return None
+        if order.index(key) <= last:
+            return None
+        last = order.index(key)
+        if value != ERR and not FIELD_RE[key].fullmatch(value):
+            return None
+        fields[key] = value
+    return fields
+
+
+# --- files -----------------------------------------------------------------------------
+
+def write_status(doc: dict) -> None:
+    directory = path(STATUS_DIR)
+    data = (json.dumps(doc, sort_keys=True, separators=(",", ":")) + "\n").encode("utf-8")
+    fd, tmp = tempfile.mkstemp(prefix=".health.", suffix=".tmp", dir=directory)
+    try:
+        with os.fdopen(fd, "wb") as fh:
+            fh.write(data)
+            fh.flush()
+            os.fchmod(fh.fileno(), 0o640)
+            if not ROOT:
+                import grp
+                os.fchown(fh.fileno(), 0, grp.getgrnam(STATUS_GROUP).gr_gid)
+            os.fsync(fh.fileno())
+        os.rename(tmp, os.path.join(directory, "health.json"))
+        dfd = os.open(directory, os.O_RDONLY | os.O_DIRECTORY)
+        try:
+            os.fsync(dfd)
+        finally:
+            os.close(dfd)
+    except BaseException:
+        try:
+            os.unlink(tmp)
+        except OSError:
+            pass
+        raise
+
+
+def lock(name: str):
+    directory = path(RUN_DIR)
+    os.makedirs(directory, mode=0o755, exist_ok=True)
+    fh = open(os.path.join(directory, name), "a")
+    try:
+        fcntl.flock(fh, fcntl.LOCK_EX | fcntl.LOCK_NB)
+    except BlockingIOError:
+        fh.close()
+        raise Failure(3, "another legatto-health collect is running")
+    return fh
+
+
+# --- commands --------------------------------------------------------------------------
+
+def require_root() -> None:
+    if not ROOT and os.geteuid() != 0:
+        raise Failure(4, "collect must run as root")
+
+
+def cmd_collect(args: argparse.Namespace) -> int:
+    now = utc_now()
+    if args.dry_run:
+        doc = build_health(now)
+        print(json.dumps({"status": doc["status"], "msg": doc["msg"]}, separators=(",", ":")))
+        return 0
+    require_root()
+    guard = lock("health.lock")
+    try:
+        doc = build_health(now)
+        write_status(doc)
+    finally:
+        guard.close()
+    if args.json:
+        print(json.dumps(doc, sort_keys=True, separators=(",", ":")))
+    else:
+        log(f"status={doc['status']}")
+    return 0
+
+
+def kuma_host() -> str:
+    conf = read_json(OPS_CONF)
+    host = conf.get("kuma_host") if conf else None
+    if not isinstance(host, str) or not KUMA_HOST_RE.match(host):
+        raise Failure(4, f"kuma_host missing or invalid in {OPS_CONF}")
+    return host
+
+
+def push_token() -> str:
+    cred_dir = os.environ.get("CREDENTIALS_DIRECTORY")
+    if not cred_dir:
+        raise Failure(4, "no CREDENTIALS_DIRECTORY (run through legatto-health.service)")
+    try:
+        with open(os.path.join(cred_dir, CREDENTIAL_NAME), encoding="ascii") as fh:
+            token = fh.read().strip()
+    except (OSError, UnicodeDecodeError):
+        raise Failure(4, f"credential {CREDENTIAL_NAME} unreadable") from None
+    if not TOKEN_RE.match(token):
+        raise Failure(4, f"credential {CREDENTIAL_NAME} has an unexpected format")
+    return token
+
+
+def cmd_push(args: argparse.Namespace) -> int:
+    doc = read_json(f"{STATUS_DIR}/health.json")
+    if doc is None or doc.get("component") != "health":
+        raise Failure(11, "status/health.json missing or invalid")
+    fields = parse_msg(doc.get("msg"))
+    if fields is None:
+        raise Failure(11, "status/health.json msg outside the allowlist; refusing to send")
+    status = doc.get("status") if doc.get("status") in ("up", "down") else "down"
+    age = age_seconds(doc.get("ts"), utc_now())
+    if age is None or age > STALE_SECONDS:
+        status = "down"  # collector stopped: report down with the last known values
+    msg = " ".join(f"{k}={v}" for k, v in fields.items())
+    host = kuma_host()
+    token = push_token()
+    query = urllib.parse.urlencode({"status": status, "msg": msg, "ping": ""})
+    url = f"https://{host}/api/push/{urllib.parse.quote(token, safe='')}?{query}"
+    opener = urllib.request.build_opener(urllib.request.ProxyHandler({"https": EGRESS_PROXY, "http": EGRESS_PROXY}))
+    request = urllib.request.Request(url, method="GET", headers={"User-Agent": "legatto-health/1"})
+    try:
+        with opener.open(request, timeout=20) as resp:
+            body = resp.read(4096)
+            code = resp.status
+    except urllib.error.HTTPError as exc:
+        raise Failure(10, f"Kuma answered HTTP {exc.code}") from None
+    except (urllib.error.URLError, OSError) as exc:
+        reason = getattr(exc, "reason", exc)
+        raise Failure(10, f"push failed: {type(reason).__name__}") from None
+    try:
+        answer = json.loads(body.decode("utf-8"))
+    except (UnicodeDecodeError, ValueError):
+        answer = None
+    if code != 200 or not isinstance(answer, dict) or answer.get("ok") is not True:
+        raise Failure(10, f"Kuma rejected the push (HTTP {code})")
+    log(f"pushed status={status}")
+    return 0
+
+
+def main(argv: list[str]) -> int:
+    parser = argparse.ArgumentParser(prog="legatto-health", description=__doc__.split("\n")[0])
+    parser.add_argument("--dry-run", action="store_true", help="print the Kuma payload and write nothing")
+    sub = parser.add_subparsers(dest="command")
+    p_collect = sub.add_parser("collect", help="build the payload and write status/health.json (root)")
+    p_collect.add_argument("--json", action="store_true")
+    p_collect.add_argument("--dry-run", action="store_true", dest="dry_run_sub")
+    sub.add_parser("push", help="send status/health.json to Uptime Kuma (legatto-mon)")
+    try:
+        args = parser.parse_args(argv)
+    except SystemExit as exc:
+        return 2 if exc.code else 0
+    try:
+        if args.command is None:
+            if not args.dry_run:
+                parser.print_usage(sys.stderr)
+                return 2
+            args.json = False
+            return cmd_collect(args)
+        if args.command == "collect":
+            args.dry_run = args.dry_run or args.dry_run_sub
+            return cmd_collect(args)
+        if args.dry_run:
+            log("--dry-run applies to collect only")
+            return 2
+        return cmd_push(args)
+    except Failure as exc:
+        log(str(exc))
+        return exc.code
+    except Exception as exc:  # noqa: BLE001 - last-resort exit code 1, no traceback with data
+        log(f"unexpected error: {type(exc).__name__}")
+        return 1
+
+
+if __name__ == "__main__":
+    sys.exit(main(sys.argv[1:]))

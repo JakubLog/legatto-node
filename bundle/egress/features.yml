@@ -1,0 +1,38 @@
+---
+# Egress allowlist: entries active only while the office admin enables the
+# feature in the console (features.set). Owner: egress lane.
+#
+# Keys: legatto_feature_names (contract.yml). Every feature is listed, also
+# those without egress, so the manifest shows the complete mapping. Enabling a
+# feature in the console is the admin's consent to its entries (R3); a release
+# that adds an entry to any feature, enabled or not, is still a widening and
+# waits for approval.
+#
+# `ics` has no static hosts: the server adds the office's own list
+# (features.json -> ics_hosts, exact names, port 443) to role `app`.
+# `hibp` is enabled by default (legatto_feature_defaults).
+version: 1
+features:
+  ai:
+    app:
+      - {host: api.anthropic.com, port: 443, purpose: "Anthropic API (PoliAI, OCR, reports)"}
+  mcp: {}
+  email:
+    app:
+      - {host: api.resend.com, port: 443, purpose: "Resend API: notification e-mails"}
+  getresponse:
+    app:
+      - {host: api.getresponse.com, port: 443, purpose: "GetResponse API (briefing)"}
+    functions:
+      - {host: api.getresponse.com, port: 443, purpose: "GetResponse API (getresponse-proxy function)"}
+  push:
+    app:
+      - {host: fcm.googleapis.com, port: 443, purpose: "Web Push: Chrome / Android (FCM)"}
+      - {host: updates.push.services.mozilla.com, port: 443, purpose: "Web Push: Firefox"}
+      - {host: web.push.apple.com, port: 443, purpose: "Web Push: Safari"}
+      - {host: "*.push.apple.com", port: 443, purpose: "Web Push: Safari (regional endpoints)"}
+      - {host: "*.notify.windows.com", port: 443, purpose: "Web Push: Edge / Windows (WNS)"}
+  ics: {}
+  hibp:
+    auth:
+      - {host: api.pwnedpasswords.com, port: 443, purpose: "GoTrue leaked-password check (k-anonymity range API)"}

@@ -1,0 +1,74 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "$id": "https://updates.legatto.pl/schema/index.schema.json",
+  "title": "Legatto release index (legatto-index/1)",
+  "description": "Entry point of the update protocol: index.json at the root of the update base URL, signed as index.json.<signer-id>.sig (`ssh-keygen -Y sign -n legatto-index`). Re-signed by a human at least monthly (`expires` at most 35 days after `issued_at`, enforced by the server). An expired index or a lower `sequence` than the last one seen makes the server report upd=stale and install nothing (freeze/replay protection).",
+  "type": "object",
+  "additionalProperties": false,
+  "required": ["schema", "product", "sequence", "issued_at", "expires", "releases", "krl_sha256"],
+  "properties": {
+    "schema": { "const": "legatto-index/1" },
+    "product": { "const": "legatto" },
+    "sequence": {
+      "description": "Index generation counter, strictly increasing with every publish, promote, yank or re-sign.",
+      "type": "integer",
+      "minimum": 1
+    },
+    "issued_at": { "$ref": "#/$defs/timestamp" },
+    "expires": { "$ref": "#/$defs/timestamp" },
+    "releases": {
+      "type": "array",
+      "items": {
+        "type": "object",
+        "additionalProperties": false,
+        "required": ["version", "sequence", "type", "manifest_sha256", "attestation_sha256", "promotions", "yanked"],
+        "properties": {
+          "version": { "$ref": "#/$defs/semver" },
+          "sequence": { "type": "integer", "minimum": 1 },
+          "type": { "enum": ["security", "feature"] },
+          "manifest_sha256": { "$ref": "#/$defs/sha256" },
+          "attestation_sha256": {
+            "description": "sha256 of attest/canary.json once it exists.",
+            "oneOf": [{ "$ref": "#/$defs/sha256" }, { "type": "null" }]
+          },
+          "promotions": {
+            "type": "object",
+            "additionalProperties": false,
+            "required": ["early", "stable"],
+            "properties": {
+              "early": { "oneOf": [{ "$ref": "#/$defs/sha256" }, { "type": "null" }] },
+              "stable": { "oneOf": [{ "$ref": "#/$defs/sha256" }, { "type": "null" }] }
+            }
+          },
+          "yanked": {
+            "description": "A yanked release is never installed; already installed servers report it and wait for a newer one.",
+            "type": "boolean"
+          },
+          "yanked_reason": { "type": "string", "maxLength": 500 }
+        },
+        "allOf": [
+          {
+            "if": { "properties": { "yanked": { "const": true } } },
+            "then": { "required": ["yanked_reason"] }
+          }
+        ]
+      }
+    },
+    "krl_sha256": {
+      "description": "sha256 of the current revoked.krl (shrink-only key revocation list), or null if none was ever published.",
+      "oneOf": [{ "$ref": "#/$defs/sha256" }, { "type": "null" }]
+    }
+  },
+  "$defs": {
+    "semver": {
+      "type": "string",
+      "pattern": "^(0|[1-9][0-9]*)\\.(0|[1-9][0-9]*)\\.(0|[1-9][0-9]*)(-(0|[1-9][0-9]*|[0-9]*[A-Za-z-][0-9A-Za-z-]*)(\\.(0|[1-9][0-9]*|[0-9]*[A-Za-z-][0-9A-Za-z-]*))*)?$"
+    },
+    "sha256": { "type": "string", "pattern": "^[0-9a-f]{64}$" },
+    "timestamp": {
+      "type": "string",
+      "format": "date-time",
+      "pattern": "^[0-9]{4}-[0-9]{2}-[0-9]{2}T[0-9]{2}:[0-9]{2}:[0-9]{2}Z$"
+    }
+  }
+}

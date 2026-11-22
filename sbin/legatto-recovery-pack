@@ -1,0 +1,645 @@
+#!/usr/bin/python3
+"""legatto-recovery-pack — office recovery pack (R10, P25), generated on the server.
+
+    legatto-recovery-pack generate --json [--actor JSON]      root (executor: recovery.generate)
+    legatto-recovery-pack verify FILE [--passphrase-stdin] [--json]
+
+The pack holds what the office needs when the server, the vendor or the
+console is gone: the form private key (X25519), the emergency console account
+(fresh password + TOTP, rotated on every generation), the password of the
+VPS-console-only account `recovery`, the pgsodium root key (Vault) and the
+PII field key. It is a tar.gz encrypted with `age -p -a` (scrypt) under a
+passphrase of ten diceware words (EFF large list, ~129 bit) that exists only
+in the --json result for the executor, which shows it once in the console.
+
+Next to the pack goes a printable card (HTML, no external resources): the
+armored ciphertext as QR codes (qrencode) and as numbered text lines with a
+CRC32 per line, plus instructions and incident contacts. The card holds no
+passphrase; keep it apart from the passphrase card.
+
+`verify` decrypts a pack (the .age file, the scanned QR payloads or the typed
+text lines), checks the manifest and every hash, and — as root on a server —
+reports whether each key still equals the server's current key. It never
+prints secret values.
+
+Exit codes: 0 ok, 1 unexpected, 2 arguments, 3 lock busy, 4 precondition
+(not root, missing key source, missing tool), 20 decryption failed
+(wrong passphrase or damaged ciphertext), 21 pack content invalid.
+"""
+
+from __future__ import annotations
+
+import argparse
+import fcntl
+import getpass
+import hashlib
+import html
+import io
+import json
+import os
+import re
+import secrets
+import select
+import subprocess
+import sys
+import tarfile
+import tempfile
+import termios
+import time
+import zlib
+from datetime import datetime, timezone
+
+ROOT = os.environ.get("LEGATTO_ROOT", "")  # test hook; empty on servers
+
+OUT_DIR = "/var/lib/legatto/recovery"                      # contract: legatto_paths.recovery
+OFFICE_ENV = "/etc/legatto/office.env"                     # contract: legatto_paths.office_env
+CREDSTORE = "/etc/credstore.encrypted"                     # contract: legatto_paths.credstore
+FORM_KEY_CREDENTIAL = "legatto-form-x25519"                # contract: legatto_credentials.form_x25519
+RECOVERY_PASSWORD = "/etc/legatto/secrets/recovery-password"  # contract: legatto_paths.recovery_password
+PGSODIUM_KEY = "/etc/legatto/secrets/pgsodium_root.key"    # contract: legatto_paths.pgsodium_key_src
+PII_KEY = "/etc/legatto/secrets/pii_field_key"             # contract: legatto_paths.pii_key_src
+CONTACTS = "/var/lib/legatto/office/contacts.json"         # contract: legatto_paths.incident_contacts
+CONSOLE_EXEC = "/usr/local/sbin/legatto-console-exec"      # contract: legatto_cli.console_exec
+AUDIT_CLI = "/usr/local/sbin/legatto-audit"                # contract: legatto_cli.audit
+RUN_DIR = "/run/legatto"                                   # contract: legatto_paths.run
+CONSOLE_GROUP = "legatto-console"                          # contract: legatto_groups.console
+EMERGENCY_LOGIN = "awaryjny"                       # contract: legatto_requests.console_emergency_login
+WORDLIST = "/opt/legatto/share/recovery-pack/eff_large_wordlist.txt"  # contract: legatto_paths.share
+# EFF large wordlist (2016-07-18): identical bytes at eff.org and in Ubuntu
+# noble package `diceware` (wordlist_en_eff.txt).
+WORDLIST_SHA256 = "addd35536511597a02fa0a9ff1e5284677b8883b83e986e43f15a3db996b903e"
+WORDS = 10
+DEFAULT_ACTOR = {"kind": "system", "id": "legatto-recovery-pack"}
+
+ITEMS = ("form-x25519", "console-emergency", "recovery-account", "pgsodium-root-key", "pii-field-key")
+ITEM_FILES = {"form-x25519": "form-x25519.key", "console-emergency": "console-emergency.json",
+              "recovery-account": "recovery-account.txt", "pgsodium-root-key": "pgsodium_root.key",
+              "pii-field-key": "pii_field_key"}
+ARMOR_BEGIN = "-----BEGIN AGE ENCRYPTED FILE-----"
+ARMOR_END = "-----END AGE ENCRYPTED FILE-----"
+QR_CHUNK_BYTES = 900
+QR_HEADER_RE = re.compile(r"^LGTRP1 ([0-9]{1,2})/([0-9]{1,2}) ([0-9a-f]{8})$")
+CARD_LINE_RE = re.compile(r"^\s*([0-9]{1,3})\s+(.+?)\s+([0-9a-f]{8})\s*$")
+SLUG_RE = re.compile(r"^[a-z][a-z0-9-]{1,30}$")
+
+
+class Failure(Exception):
+    def __init__(self, code: int, message: str):
+        super().__init__(message)
+        self.code = code
+
+
+def path(p: str) -> str:
+    return ROOT + p
+
+
+def log(message: str) -> None:
+    print(f"legatto-recovery-pack: {message}", file=sys.stderr)
+
+
+def utc_now() -> datetime:
+    return datetime.now(timezone.utc).replace(microsecond=0)
+
+
+def fmt_ts(dt: datetime) -> str:
+    return dt.strftime("%Y-%m-%dT%H:%M:%SZ")
+
+
+def sha256(data: bytes) -> str:
+    return hashlib.sha256(data).hexdigest()
+
+
+# --- age with a passphrase -----------------------------------------------------------------
+
+def run_age(args: list[str], passphrase: str, data: bytes, prompts: int, timeout: int = 120) -> tuple[int, bytes]:
+    """Run age reading the passphrase from a private pseudo-terminal.
+
+    `age -p` and `age -d` read passphrases only from a terminal. The child gets
+    a new session with the pty slave as controlling terminal (/dev/tty); the
+    passphrase never appears in argv, environment or a file. stdout carries
+    the result; prompts and age's own messages stay on the pty/stderr.
+    """
+    master, slave = os.openpty()
+
+    def make_tty() -> None:
+        fcntl.ioctl(slave, termios.TIOCSCTTY, 0)
+
+    try:
+        proc = subprocess.Popen(["age", *args], stdin=subprocess.PIPE, stdout=subprocess.PIPE,
+                                stderr=subprocess.PIPE, start_new_session=True, preexec_fn=make_tty,
+                                pass_fds=(slave,), env={"PATH": os.environ.get("PATH", "/usr/bin:/bin"),
+                                                        "LC_ALL": "C", "TERM": "dumb"})
+    except FileNotFoundError:
+        os.close(master)
+        os.close(slave)
+        raise Failure(4, "age is not installed") from None
+    os.close(slave)
+    assert proc.stdin and proc.stdout and proc.stderr
+    out = bytearray()
+    sent = 0
+    pending_prompt = b""
+    deadline = time.monotonic() + timeout
+    stdin_buf = memoryview(data)
+    streams = {proc.stdout.fileno(): "out", proc.stderr.fileno(): "err", master: "tty"}
+    writers = [proc.stdin.fileno()] if data else []
+    if not data:
+        proc.stdin.close()
+    try:
+        while streams and time.monotonic() < deadline:
+            readable, writable, _ = select.select(list(streams), writers, [], 1.0)
+            for fd in writable:
+                n = os.write(fd, stdin_buf[:65536])
+                stdin_buf = stdin_buf[n:]
+                if not stdin_buf:
+                    writers = []
+                    proc.stdin.close()
+            for fd in readable:
+                try:
+                    chunk = os.read(fd, 65536)
+                except OSError:
+                    chunk = b""
+                if not chunk:
+                    del streams[fd]
+                    continue
+                kind = streams[fd]
+                if kind == "out":
+                    out += chunk
+                elif kind == "tty":
+                    pending_prompt += chunk
+                    if b"passphrase" in pending_prompt.lower() and sent < prompts:
+                        os.write(master, passphrase.encode("utf-8") + b"\n")
+                        sent += 1
+                        pending_prompt = b""
+            if proc.poll() is not None and not readable:
+                break
+        else:
+            if streams:
+                proc.kill()
+    finally:
+        os.close(master)
+        if writers:
+            proc.stdin.close()
+    rc = proc.wait(timeout=10)
+    return rc, bytes(out)
+
+
+# --- pack building -------------------------------------------------------------------------
+
+def read_secret_file(p: str) -> bytes | None:
+    try:
+        with open(path(p), "rb") as fh:
+            data = fh.read(64 * 1024)
+    except OSError:
+        return None
+    return data if data.strip() else None
+
+
+def form_key() -> bytes | None:
+    cred = path(f"{CREDSTORE}/{FORM_KEY_CREDENTIAL}")
+    if not os.path.isfile(cred):
+        return None
+    if ROOT:  # tests: plaintext stand-in
+        return read_secret_file(f"{CREDSTORE}/{FORM_KEY_CREDENTIAL}")
+    proc = subprocess.run(["systemd-creds", "decrypt", f"--name={FORM_KEY_CREDENTIAL}", cred, "-"],
+                          capture_output=True, timeout=60, check=False)
+    return proc.stdout if proc.returncode == 0 and proc.stdout.strip() else None
+
+
+def emergency_credentials(actor: dict) -> bytes:
+    proc = subprocess.run([path(CONSOLE_EXEC), "emergency-credentials", "--json",
+                           "--actor", json.dumps(actor, separators=(",", ":"))],
+                          capture_output=True, timeout=120, check=False)
+    if proc.returncode != 0:
+        raise Failure(4, f"legatto-console-exec emergency-credentials failed (exit {proc.returncode})")
+    try:
+        creds = json.loads(proc.stdout.decode("utf-8"))
+    except (UnicodeDecodeError, ValueError):
+        raise Failure(4, "legatto-console-exec emergency-credentials returned no JSON") from None
+    required = ("login", "password", "totp_secret", "otpauth_uri")
+    if not isinstance(creds, dict) or not all(isinstance(creds.get(k), str) and creds[k] for k in required) \
+            or creds["login"] != EMERGENCY_LOGIN:
+        raise Failure(4, "legatto-console-exec emergency-credentials returned an unexpected object")
+    doc = {k: creds[k] for k in required}
+    return (json.dumps(doc, ensure_ascii=False, indent=1) + "\n").encode("utf-8")
+
+
+def office_slug() -> str:
+    try:
+        with open(path(OFFICE_ENV), encoding="utf-8") as fh:
+            for line in fh:
+                key, sep, value = line.rstrip("\n").partition("=")
+                if sep and key == "LEGATTO_SLUG" and SLUG_RE.match(value):
+                    return value
+    except OSError:
+        pass
+    raise Failure(4, f"LEGATTO_SLUG missing in {OFFICE_ENV}")
+
+
+def contacts_text() -> str:
+    try:
+        with open(path(CONTACTS), "rb") as fh:
+            doc = json.loads(fh.read(64 * 1024).decode("utf-8"))
+    except (OSError, UnicodeDecodeError, ValueError):
+        return "Kontakty do zgłoszeń: nie wpisano w panelu biura.\n"
+    lines = ["Kontakty do zgłoszeń (wpisane przez biuro w panelu):"]
+    labels = (("primary", "Zgłasza naruszenie do UODO (RODO art. 33)"), ("secondary", "Zastępca"),
+              ("iod", "Inspektor Ochrony Danych"))
+    for key, label in labels:
+        person = doc.get(key) if isinstance(doc, dict) else None
+        if isinstance(person, dict):
+            parts = [str(person.get(f, "")).strip()[:120] for f in ("name", "email", "phone")]
+            lines.append(f"- {label}: " + ", ".join(p for p in parts if p))
+    notes = doc.get("notes") if isinstance(doc, dict) else None
+    if isinstance(notes, str) and notes.strip():
+        lines.append(f"- Uwagi: {notes.strip()[:200]}")
+    return "\n".join(lines) + "\n"
+
+
+def instructions(slug: str, created_at: str) -> str:
+    return f"""PAKIET ODZYSKIWANIA LEGATTO — biuro {slug}, utworzony {created_at}
+
+Pakiet jest zaszyfrowany narzędziem age hasłem z dziesięciu słów. Hasło
+pokazano raz w panelu biura; przechowuj je osobno od pakietu i od karty.
+
+Odszyfrowanie (dowolny komputer z age: https://age-encryption.org):
+    age -d -o pakiet.tar.gz legatto-recovery-{slug}-….tar.age
+    tar -xzf pakiet.tar.gz
+Z karty: zeskanuj kody QR po kolei albo przepisz wiersze tekstu (bez numeru
+i sumy CRC na końcu wiersza) do pliku .age i odszyfruj jak wyżej.
+Kontrola bez ujawniania treści: legatto-recovery-pack verify PLIK
+
+Zawartość:
+- form-x25519.key       klucz prywatny formularza strony (odczyt zgłoszeń z kolejki)
+- console-emergency.json  konto awaryjne panelu biura `{EMERGENCY_LOGIN}`: hasło i TOTP
+                          (dodaj otpauth_uri do aplikacji uwierzytelniającej)
+- recovery-account.txt  hasło konta `recovery` — logowanie TYLKO z konsoli VPS
+                        w panelu Hetzner (Owner projektu: biuro)
+- pgsodium_root.key     klucz główny Vault/pgsodium bazy danych
+- pii_field_key         klucz szyfrowania pól z danymi osobowymi w aplikacji
+- manifest.json         sumy SHA-256 powyższych plików
+
+Każde wygenerowanie nowego pakietu zmienia hasło i TOTP konta awaryjnego
+panelu — starszy pakiet przestaje wtedy działać dla panelu. Klucze danych
+pozostają ważne do ich rotacji.
+
+Gdy serwer jest niedostępny: zaloguj się do projektu Hetzner (Owner),
+otwórz konsolę serwera, zaloguj się jako `recovery`. Odtworzenie serwera
+z backupu Hetzner: panel Hetzner → serwer → Backups → wybrana kopia.
+"""
+
+
+def build_tar(files: dict[str, bytes], mtime: int) -> bytes:
+    buf = io.BytesIO()
+    with tarfile.open(fileobj=buf, mode="w:gz", format=tarfile.USTAR_FORMAT, compresslevel=9) as tar:
+        for name in sorted(files):
+            info = tarfile.TarInfo(name)
+            info.size = len(files[name])
+            info.mtime = mtime
+            info.mode = 0o400
+            info.uname = info.gname = "root"
+            tar.addfile(info, io.BytesIO(files[name]))
+    return buf.getvalue()
+
+
+def load_wordlist() -> list[str]:
+    try:
+        with open(path(WORDLIST), "rb") as fh:
+            raw = fh.read()
+    except OSError:
+        raise Failure(4, f"wordlist missing: {WORDLIST}") from None
+    if sha256(raw) != WORDLIST_SHA256:
+        raise Failure(4, "wordlist hash mismatch")
+    words = [line.split("\t")[1] for line in raw.decode("ascii").splitlines() if "\t" in line]
+    if len(words) != 7776 or len(set(words)) != 7776:
+        raise Failure(4, "wordlist content unexpected")
+    return words
+
+
+def passphrase() -> str:
+    words = load_wordlist()
+    return " ".join(secrets.choice(words) for _ in range(WORDS))
+
+
+# --- printable card ------------------------------------------------------------------------
+
+def qr_chunks(armored: str) -> list[str]:
+    lines = armored.strip("\n").split("\n")
+    groups: list[list[str]] = [[]]
+    for line in lines:
+        if groups[-1] and sum(len(x) + 1 for x in groups[-1]) + len(line) + 1 > QR_CHUNK_BYTES:
+            groups.append([])
+        groups[-1].append(line)
+    tag = sha256(armored.encode())[:8]
+    return [f"LGTRP1 {i + 1}/{len(groups)} {tag}\n" + "\n".join(g) for i, g in enumerate(groups)]
+
+
+def qr_svg(payload: str) -> str:
+    try:
+        proc = subprocess.run(["qrencode", "-t", "SVG", "--svg-path", "-8", "-l", "M", "-m", "2", "-s", "4",
+                               "-o", "-"],
+                              input=payload.encode("ascii"), capture_output=True, timeout=60, check=False)
+    except FileNotFoundError:
+        raise Failure(4, "qrencode is not installed") from None
+    svg = proc.stdout.decode("utf-8", "replace")
+    if proc.returncode != 0 or "<svg" not in svg:
+        raise Failure(1, "qrencode failed")
+    return svg[svg.index("<svg"):]
+
+
+def card_html(slug: str, created_at: str, armored: str, pack_sha: str, contacts: str) -> str:
+    chunks = qr_chunks(armored)
+    qrs = "\n".join(f'<figure><figcaption>Kod {i + 1} z {len(chunks)}</figcaption>{qr_svg(c)}</figure>'
+                    for i, c in enumerate(chunks))
+    rows = "\n".join(f"{n:03d}  {line}  {zlib.crc32(line.encode()) & 0xffffffff:08x}"
+                     for n, line in enumerate(armored.strip("\n").split("\n"), start=1))
+    esc = html.escape
+    return f"""<!doctype html>
+<html lang="pl"><head><meta charset="utf-8">
+<title>Karta odzyskiwania Legatto — {esc(slug)}</title>
+<style>
+body{{font-family:sans-serif;margin:12mm;font-size:10.5pt}} h1{{font-size:15pt}}
+pre{{font-family:monospace;font-size:8.5pt;white-space:pre;border:1px solid #000;padding:3mm}}
+figure{{display:inline-block;margin:0 6mm 6mm 0;break-inside:avoid}} figure svg{{width:85mm;height:auto}}
+.warn{{border:2px solid #000;padding:3mm;font-weight:bold}} @page{{size:A4;margin:10mm}}
+</style></head><body>
+<h1>Karta odzyskiwania Legatto — biuro {esc(slug)}</h1>
+<p>Utworzono: {esc(created_at)} UTC. SHA-256 pakietu: <code>{esc(pack_sha)}</code></p>
+<p class="warn">Karta zawiera wyłącznie zaszyfrowany pakiet. Hasło (10 słów) przechowuj osobno,
+u innej osoby niż tę kartę. Nie wpisuj hasła na tej kartce.</p>
+<h2>Kody QR</h2>
+<p>Każdy kod zaczyna się wierszem <code>LGTRP1 n/N</code>. Złóż treść kodów w kolejności numerów,
+pomiń pierwsze wiersze kodów i zapisz wynik jako plik <code>pakiet.age</code>
+(albo przekaż zeskanowane treści w dowolnej kolejności do <code>legatto-recovery-pack verify</code>).</p>
+{qrs}
+<h2>Ten sam pakiet jako tekst</h2>
+<p>Przy przepisywaniu pomiń numer wiersza i 8-znakową sumę CRC32 na końcu; suma pozwala znaleźć pomyłkę
+w wierszu. <code>legatto-recovery-pack verify</code> przyjmuje też plik z wierszami w tej postaci.</p>
+<pre>{esc(rows)}</pre>
+<h2>Instrukcja</h2>
+<pre>{esc(instructions(slug, created_at))}</pre>
+<pre>{esc(contacts)}</pre>
+</body></html>
+"""
+
+
+# --- reading packs back --------------------------------------------------------------------
+
+def armored_from_text(text: str) -> str:
+    text = text.replace("\r\n", "\n")
+    if text.lstrip().startswith(ARMOR_BEGIN):
+        return text.lstrip()
+    chunks: dict[int, list[str]] = {}
+    total = tag = None
+    current: list[str] | None = None
+    numbered: dict[int, str] = {}
+    for line in text.split("\n"):
+        m = QR_HEADER_RE.match(line.strip())
+        if m:
+            index, count = int(m.group(1)), int(m.group(2))
+            if total not in (None, count) or tag not in (None, m.group(3)):
+                raise Failure(21, "QR codes from different packs")
+            total, tag = count, m.group(3)
+            current = chunks.setdefault(index, [])
+            continue
+        c = CARD_LINE_RE.match(line)
+        if c and current is None:
+            if zlib.crc32(c.group(2).encode()) & 0xffffffff != int(c.group(3), 16):
+                raise Failure(21, f"CRC mismatch in text line {int(c.group(1))}")
+            numbered[int(c.group(1))] = c.group(2)
+            continue
+        if current is not None and line.strip():
+            current.append(line.strip())
+    if numbered:
+        if sorted(numbered) != list(range(1, len(numbered) + 1)):
+            raise Failure(21, "text lines missing")
+        armored = "\n".join(numbered[n] for n in sorted(numbered)) + "\n"
+    elif chunks:
+        if total is None or sorted(chunks) != list(range(1, total + 1)):
+            raise Failure(21, "QR codes missing")
+        armored = "\n".join(line for i in sorted(chunks) for line in chunks[i]) + "\n"
+        if sha256(armored.encode())[:8] != tag:
+            raise Failure(21, "QR codes do not reassemble into the original pack")
+    else:
+        raise Failure(21, "no age armor, QR payloads or card lines found")
+    if not armored.startswith(ARMOR_BEGIN) or ARMOR_END not in armored:
+        raise Failure(21, "reassembled text is not an age armored file")
+    return armored
+
+
+def current_fingerprints() -> dict[str, str | None]:
+    """sha256 of the server's current keys (root on a server only)."""
+    if not ROOT and os.geteuid() != 0:
+        return {}
+    current: dict[str, str | None] = {}
+    key = form_key()
+    current["form-x25519"] = sha256(key) if key else None
+    for item, src in (("recovery-account", RECOVERY_PASSWORD), ("pgsodium-root-key", PGSODIUM_KEY),
+                      ("pii-field-key", PII_KEY)):
+        data = read_secret_file(src)
+        current[item] = sha256(data) if data else None
+    return current
+
+
+def check_pack(plain: bytes) -> dict:
+    try:
+        with tarfile.open(fileobj=io.BytesIO(plain), mode="r:gz") as tar:
+            files = {}
+            for member in tar.getmembers():
+                if not member.isfile() or "/" in member.name or member.size > 256 * 1024:
+                    raise Failure(21, "unexpected entry in pack")
+                extracted = tar.extractfile(member)
+                assert extracted is not None
+                files[member.name] = extracted.read()
+    except (tarfile.TarError, OSError, EOFError):
+        raise Failure(21, "decrypted data is not a tar.gz") from None
+    try:
+        manifest = json.loads(files["manifest.json"].decode("utf-8"))
+    except (KeyError, UnicodeDecodeError, ValueError):
+        raise Failure(21, "manifest.json missing or invalid") from None
+    if manifest.get("v") != 1 or not isinstance(manifest.get("items"), list):
+        raise Failure(21, "manifest.json has an unexpected shape")
+    current = current_fingerprints()
+    report = []
+    seen = set()
+    for entry in manifest["items"]:
+        name = entry.get("name") if isinstance(entry, dict) else None
+        fname = ITEM_FILES.get(name or "")
+        data = files.get(fname or "")
+        ok = data is not None and entry.get("file") == fname and sha256(data) == entry.get("sha256")
+        if name == "console-emergency" and ok:
+            try:
+                creds = json.loads(data.decode("utf-8"))
+                ok = all(isinstance(creds.get(k), str) and creds[k]
+                         for k in ("login", "password", "totp_secret", "otpauth_uri"))
+            except (UnicodeDecodeError, ValueError, AttributeError):
+                ok = False
+        seen.add(name)
+        item = {"name": name, "ok": ok}
+        if name in current:
+            item["current"] = ok and current[name] == entry.get("sha256")
+        report.append(item)
+    missing = [i for i in ITEMS if i not in seen]
+    ok = not missing and all(i["ok"] for i in report) and "RECOVERY.pl.txt" in files
+    return {"ok": ok, "slug": manifest.get("slug"), "created_at": manifest.get("created_at"),
+            "items": report, "missing": missing}
+
+
+# --- commands ------------------------------------------------------------------------------
+
+def parse_actor(raw: str | None) -> dict:
+    if raw is None:
+        return dict(DEFAULT_ACTOR)
+    try:
+        actor = json.loads(raw)
+    except ValueError:
+        raise Failure(2, "--actor is not JSON") from None
+    if not isinstance(actor, dict) or actor.get("kind") not in ("office-admin", "vendor", "system", "bootstrap") \
+            or not isinstance(actor.get("id"), str) or not 1 < len(actor["id"]) <= 64:
+        raise Failure(2, "--actor must be {\"kind\":…,\"id\":…}")
+    return actor
+
+
+def audit(actor: dict, params: dict) -> int | None:
+    cmd = [path(AUDIT_CLI), "append", "--cat", "backup", "--event", "backup.recovery_pack",
+           "--actor", json.dumps(actor, separators=(",", ":")),
+           "--params", json.dumps(params, sort_keys=True, separators=(",", ":"))]
+    try:
+        proc = subprocess.run(cmd, capture_output=True, timeout=60, check=False)
+        return int(json.loads(proc.stdout.decode("utf-8"))["seq"]) if proc.returncode == 0 else None
+    except (OSError, subprocess.TimeoutExpired, ValueError, KeyError, TypeError, UnicodeDecodeError):
+        return None
+
+
+def write_out(name: str, data: bytes) -> str:
+    directory = path(OUT_DIR)
+    fd, tmp = tempfile.mkstemp(prefix=".pack.", dir=directory)
+    try:
+        with os.fdopen(fd, "wb") as fh:
+            fh.write(data)
+            fh.flush()
+            os.fchmod(fh.fileno(), 0o640)
+            if not ROOT:
+                import grp
+                os.fchown(fh.fileno(), 0, grp.getgrnam(CONSOLE_GROUP).gr_gid)
+            os.fsync(fh.fileno())
+        final = os.path.join(directory, name)
+        os.rename(tmp, final)
+    except BaseException:
+        try:
+            os.unlink(tmp)
+        except OSError:
+            pass
+        raise
+    return os.path.join(OUT_DIR, name)
+
+
+def cmd_generate(args: argparse.Namespace) -> int:
+    if not args.json:
+        raise Failure(2, "generate prints the passphrase only into the --json result for the office console")
+    actor = parse_actor(args.actor)
+    if not ROOT and os.geteuid() != 0:
+        raise Failure(4, "generate must run as root")
+    os.makedirs(path(RUN_DIR), mode=0o755, exist_ok=True)
+    guard = open(path(f"{RUN_DIR}/recovery-pack.lock"), "a")
+    try:
+        fcntl.flock(guard, fcntl.LOCK_EX | fcntl.LOCK_NB)
+    except BlockingIOError:
+        guard.close()
+        raise Failure(3, "another legatto-recovery-pack is running") from None
+    try:
+        slug = office_slug()
+        sources = {"form-x25519": form_key(), "recovery-account": read_secret_file(RECOVERY_PASSWORD),
+                   "pgsodium-root-key": read_secret_file(PGSODIUM_KEY), "pii-field-key": read_secret_file(PII_KEY)}
+        missing = [k for k, v in sources.items() if v is None]
+        if missing:
+            raise Failure(4, "key source missing: " + ", ".join(missing))
+        phrase = passphrase()
+        # Last source: rotates the emergency console account (old packs stop working for the console).
+        sources["console-emergency"] = emergency_credentials(actor)
+        now = utc_now()
+        created_at = fmt_ts(now)
+        contacts = contacts_text()
+        files = {ITEM_FILES[k]: v for k, v in sources.items()}
+        files["RECOVERY.pl.txt"] = (instructions(slug, created_at) + "\n" + contacts).encode("utf-8")
+        manifest = {"v": 1, "slug": slug, "created_at": created_at,
+                    "items": [{"name": k, "file": ITEM_FILES[k], "sha256": sha256(sources[k])} for k in ITEMS]}
+        files["manifest.json"] = (json.dumps(manifest, indent=1, sort_keys=True) + "\n").encode("utf-8")
+        plain = build_tar(files, int(now.timestamp()))
+        rc, armored = run_age(["-p", "-a"], phrase, plain, prompts=2)
+        if rc != 0 or not armored.startswith(ARMOR_BEGIN.encode()):
+            raise Failure(1, f"age encryption failed (exit {rc})")
+        rc, check = run_age(["-d"], phrase, armored, prompts=1)
+        if rc != 0 or check != plain:
+            raise Failure(1, "age round trip failed")
+        pack_sha = sha256(armored)
+        stamp = now.strftime("%Y%m%dT%H%M%SZ")
+        base = f"legatto-recovery-{slug}-{stamp}"
+        card = card_html(slug, created_at, armored.decode("ascii"), pack_sha, contacts)
+        pack_path = write_out(f"{base}.tar.age", armored)
+        card_path = write_out(f"{base}-karta.html", card.encode("utf-8"))
+        seq = audit(actor, {"file": os.path.basename(pack_path), "sha256": pack_sha, "bytes": len(armored),
+                            "items": list(ITEMS)})
+    finally:
+        guard.close()
+    print(json.dumps({"v": 1, "file": pack_path, "card": card_path, "sha256": pack_sha, "bytes": len(armored),
+                      "password": phrase, "items": list(ITEMS), "audit_seq": seq}, separators=(",", ":")))
+    return 0 if seq is not None else 1
+
+
+def cmd_verify(args: argparse.Namespace) -> int:
+    try:
+        with open(args.file, "rb") as fh:
+            raw = fh.read(1024 * 1024)
+    except OSError:
+        raise Failure(2, f"cannot read {args.file}") from None
+    armored = armored_from_text(raw.decode("utf-8", "replace"))
+    if args.passphrase_stdin:
+        phrase = sys.stdin.readline().rstrip("\n")
+    else:
+        phrase = getpass.getpass("Hasło pakietu (10 słów): ")
+    if not phrase:
+        raise Failure(2, "empty passphrase")
+    rc, plain = run_age(["-d"], phrase, armored.encode("ascii"), prompts=1)
+    if rc != 0 or not plain:
+        raise Failure(20, "decryption failed: wrong passphrase or damaged pack")
+    result = check_pack(plain)
+    result["sha256"] = sha256(armored.encode("ascii"))
+    if args.json:
+        print(json.dumps(result, sort_keys=True, separators=(",", ":")))
+    else:
+        for item in result["items"]:
+            state = "OK" if item["ok"] else "BŁĄD"
+            extra = "" if "current" not in item else (" (aktualny)" if item["current"] else " (NIEAKTUALNY)")
+            print(f"{state:5} {item['name']}{extra}")
+        for name in result["missing"]:
+            print(f"BRAK  {name}")
+        print("Pakiet poprawny." if result["ok"] else "Pakiet NIEPOPRAWNY.")
+    return 0 if result["ok"] else 21
+
+
+def main(argv: list[str]) -> int:
+    parser = argparse.ArgumentParser(prog="legatto-recovery-pack", description=__doc__.split("\n")[0])
+    sub = parser.add_subparsers(dest="command", required=True)
+    p_gen = sub.add_parser("generate", help="new pack + card in /var/lib/legatto/recovery (root)")
+    p_gen.add_argument("--json", action="store_true")
+    p_gen.add_argument("--actor")
+    p_ver = sub.add_parser("verify", help="decrypt and check a pack (file, QR payloads or card text)")
+    p_ver.add_argument("file")
+    p_ver.add_argument("--passphrase-stdin", action="store_true", help="read the passphrase from stdin")
+    p_ver.add_argument("--json", action="store_true")
+    try:
+        args = parser.parse_args(argv)
+    except SystemExit as exc:
+        return 2 if exc.code else 0
+    try:
+        return cmd_generate(args) if args.command == "generate" else cmd_verify(args)
+    except Failure as exc:
+        log(str(exc))
+        return exc.code
+    except Exception as exc:  # noqa: BLE001
+        log(f"unexpected error: {type(exc).__name__}")
+        return 1
+
+
+if __name__ == "__main__":
+    sys.exit(main(sys.argv[1:]))

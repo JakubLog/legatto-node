@@ -1,0 +1,12 @@
+# vercel.json cron /api/cron/sync-ics, schedule "0 4 * * *" (UTC, Vercel semantics).
+[Unit]
+Description=Legatto app cron sync-ics (daily 04:00 UTC)
+
+[Timer]
+OnCalendar=*-*-* 04:00:00 UTC
+Persistent=true
+AccuracySec=1min
+Unit=legatto-cron@sync-ics.service
+
+[Install]
+WantedBy=timers.target

@@ -1,0 +1,590 @@
+#!/usr/bin/python3
+"""legatto-breakglass — the vendor service window (CONTRACT §4.6).
+
+The vendor (group:vendor, accounts v-<name>) reaches the server only inside a
+window opened by the office admin (office console -> executor -> `enable`).
+Three independent mechanisms end a window:
+  1. this tool's `reconcile` timer (every minute, Persistent, after boot);
+  2. the kernel timeout of the elements in nft sets bg4/bg6 (monotonic clock);
+  3. `disable`/expiry cuts live sessions (`conntrack -D`, `loginctl terminate-user`).
+
+Subcommands:
+  enable --hours N --reason T --actor J     open a window
+  disable [--reason T] --actor J            close it now
+  reconcile [--sets-only]                   expiry, vendor sets, drift repair
+  status [--json]                           breakglass.json
+  summary --window ID [--json]              what happened in a window
+
+Exit codes: 0 OK, 1 error, 2 bad arguments, 3 lock busy, 4 precondition,
+20 window already active (enable) / not active (disable),
+21 policy assertion failed (nft sets cut the vendor regardless; breakglass.error).
+"""
+
+from __future__ import annotations
+
+import argparse
+import grp
+import json
+import os
+import pwd
+import re
+import secrets
+import sys
+
+if os.environ.get("LEGATTO_TEST_ROOT") and os.environ.get("LEGATTO_NET_LIB"):
+    sys.path.insert(0, os.environ["LEGATTO_NET_LIB"])
+sys.path.insert(1, os.path.join(os.path.dirname(os.path.realpath(__file__)), "..", "lib", "net"))
+import legatto_net as ln  # noqa: E402
+
+EXIT_STATE = 20
+EXIT_ASSERT = 21
+HOURS_MIN = 1  # contract: legatto_breakglass.hours_min
+HOURS_MAX = 8  # contract: legatto_breakglass.hours_max
+REASON_MIN = 10  # contract: legatto_breakglass.reason_min_chars
+REASON_MAX = 500  # contract: legatto_breakglass.reason_max_chars
+STATE = os.path.join(ln.BREAKGLASS_DIR, "state.json")
+VENDOR_CACHE = os.path.join(ln.BREAKGLASS_DIR, "vendors.json")
+# included by /etc/nftables.conf (`include ".../breakglass/nft/*.nft"`)
+VENDOR_NFT = os.path.join(ln.BREAKGLASS_DIR, "nft", "vendors.nft")
+SUMMARIES = os.path.join(ln.BREAKGLASS_DIR, "summaries")
+STATIC = os.path.join(ln.POLICY_DIR, "static.json")
+LOCK = os.path.join(ln.RUN_DIR, "breakglass.lock")
+CADDY_UNIT = "legatto-caddy.service"  # contract: legatto_units.caddy
+CADDY_ADMIN_LOGGER = "http.log.access.admin"
+CADDY_CURSOR = os.path.join(ln.AUDIT_STATE, "caddy-admin.cursor")
+SYSTEM_ACTOR = {"kind": "system", "id": "legatto-breakglass"}
+WINDOW_ID_RE = re.compile(r"^[0-9]{8}T[0-9]{6}Z-[0-9a-f]{6}$")
+SUMMARY_LIST_MAX = 500
+ADMIN_PATHS_MAX = 50
+
+
+# --- state ----------------------------------------------------------------------------------
+
+def load_state() -> dict:
+    state = ln.read_json(STATE, default=None)
+    if not isinstance(state, dict):
+        return {"v": 1, "active": False}
+    return state
+
+
+def save_state(state: dict) -> None:
+    ln.write_json(STATE, state, 0o640, ln.STATUS_GROUP)
+
+
+def window_expired(state: dict) -> bool:
+    try:
+        return ln.now() >= ln.parse_ts(state["expires_at"])
+    except (KeyError, ValueError):
+        return True
+
+
+def seconds_left(state: dict) -> int:
+    try:
+        return max(0, int((ln.parse_ts(state["expires_at"]) - ln.now()).total_seconds()))
+    except (KeyError, ValueError):
+        return 0
+
+
+def publish_status(state: dict, ok: bool = True) -> None:
+    active = bool(state.get("active")) and not window_expired(state)
+    ln.write_status("breakglass", ok and not state.get("last_error"), {
+        "active": active,
+        "window_id": state.get("window_id") if active else None,
+        "actor": state.get("actor") if active else None,
+        "reason": state.get("reason") if active else None,
+        "started_at": state.get("started_at") if active else None,
+        "expires_at": state.get("expires_at") if active else None,
+    })
+
+
+def status_doc(state: dict) -> dict:
+    active = bool(state.get("active")) and not window_expired(state)
+    return {
+        "v": 1, "component": "breakglass", "ts": ln.fmt_ts(ln.now()), "ok": not state.get("last_error"),
+        "active": active,
+        "window_id": state.get("window_id") if active else None,
+        "actor": state.get("actor") if active else None,
+        "reason": state.get("reason") if active else None,
+        "started_at": state.get("started_at") if active else None,
+        "expires_at": state.get("expires_at") if active else None,
+    }
+
+
+# --- vendors and nft sets ------------------------------------------------------------------------
+
+def static_vendors() -> list:
+    doc = ln.read_json(STATIC, default={})
+    vendors = doc.get("vendors", []) if isinstance(doc, dict) else []
+    return [v for v in vendors if isinstance(v, str) and ln.VENDOR_RE.match(v)]
+
+
+def vendor_addresses() -> tuple:
+    """Vendor node addresses from Headscale; falls back to the last known list.
+
+    The fallback matters at boot: nftables starts before Headscale and the
+    vendor kill-switch sets must not stay empty.
+    """
+    vendors = static_vendors()
+    try:
+        v4, v6 = ln.vendor_ips(ln.headscale_nodes(), vendors)
+    except ln.ToolError as exc:
+        cache = ln.read_json(VENDOR_CACHE, default={}) or {}
+        ln.warn(f"headscale unavailable ({exc}); using cached vendor addresses")
+        return list(cache.get("v4", [])), list(cache.get("v6", [])), False
+    cache = ln.read_json(VENDOR_CACHE, default={}) or {}
+    if cache.get("v4") != v4 or cache.get("v6") != v6:
+        ln.write_json(VENDOR_CACHE, {"v": 1, "v4": v4, "v6": v6, "updated_at": ln.fmt_ts(ln.now())}, 0o640, None)
+    return v4, v6, True
+
+
+def apply_sets(v4: list, v6: list, window_seconds: int) -> None:
+    """One atomic nft transaction: vendor sets, and the window sets with timeout."""
+    sets = ln.NFT_SETS
+    table = f"{ln.NFT_FAMILY} {ln.NFT_TABLE}"
+    lines = [f"flush set {table} {sets[name]}" for name in ("vendor4", "vendor6", "window4", "window6")]
+    if v4:
+        lines.append(f"add element {table} {sets['vendor4']} {{ {ln.nft_element_line(v4)} }}")
+    if v6:
+        lines.append(f"add element {table} {sets['vendor6']} {{ {ln.nft_element_line(v6)} }}")
+    if window_seconds > 0:
+        if v4:
+            lines.append(f"add element {table} {sets['window4']} {{ {ln.nft_element_line(v4, window_seconds)} }}")
+        if v6:
+            lines.append(f"add element {table} {sets['window6']} {{ {ln.nft_element_line(v6, window_seconds)} }}")
+    # file first: a failed kernel update must still leave the next load fail-closed
+    persist_vendor_sets(v4, v6)
+    ln.nft_apply("\n".join(lines) + "\n")
+
+
+def persist_vendor_sets(v4: list, v6: list) -> None:
+    """Keep the vendor sets in a file loaded with every nftables.conf load (fail closed)."""
+    sets = ln.NFT_SETS
+    lines = [f"# Written by legatto-breakglass; loaded by {ln.NFT_MAIN.removeprefix(ln.ROOT)}. Do not edit.",
+             f"table {ln.NFT_FAMILY} {ln.NFT_TABLE} {{"]
+    for name, family, addresses in ((sets["vendor4"], "ipv4_addr", v4), (sets["vendor6"], "ipv6_addr", v6)):
+        elements = f" elements = {{ {ln.nft_element_line(addresses)} }}" if addresses else ""
+        lines.append(f"\tset {name} {{ type {family};{elements} }}")
+    lines.append("}")
+    data = ("\n".join(lines) + "\n").encode()
+    try:
+        with open(VENDOR_NFT, "rb") as fh:
+            if fh.read() == data:
+                return
+    except FileNotFoundError:
+        pass
+    ln.atomic_write(VENDOR_NFT, data, 0o600, None)
+
+
+def flush_window_sets() -> None:
+    table = f"{ln.NFT_FAMILY} {ln.NFT_TABLE}"
+    ln.nft_apply(f"flush set {table} {ln.NFT_SETS['window4']}\nflush set {table} {ln.NFT_SETS['window6']}\n")
+
+
+def window_sets_nonempty() -> bool:
+    try:
+        return bool(ln.nft_set_elements(ln.NFT_SETS["window4"]) or ln.nft_set_elements(ln.NFT_SETS["window6"]))
+    except ln.ToolError:
+        return False
+
+
+def cut_sessions(v4: list, v6: list) -> dict:
+    """Drop conntrack entries of vendor nodes and end ssh sessions of legatto-ops."""
+    flows = 0
+    for ip in v4 + v6:
+        family = ["-f", "ipv6"] if ":" in ip else []
+        for direction in ("-s", "-d"):
+            proc = ln.run(["conntrack", "-D", *family, direction, ip], check=False, timeout=15)
+            match = re.search(r"(\d+) flow entries have been deleted", proc.stderr + proc.stdout)
+            if match:
+                flows += int(match.group(1))
+    try:
+        members = set(grp.getgrnam(ln.OPS_GROUP).gr_mem)
+        gid = grp.getgrnam(ln.OPS_GROUP).gr_gid
+        members |= {p.pw_name for p in pwd.getpwall() if p.pw_gid == gid}
+    except KeyError:
+        members = set()
+    terminated = []
+    proc = ln.run(["loginctl", "list-users", "--no-legend"], check=False, timeout=15)
+    for line in proc.stdout.splitlines():
+        fields = line.split()
+        if len(fields) >= 2 and fields[1] in members:
+            ln.run(["loginctl", "terminate-user", fields[1]], check=False, timeout=15)
+            terminated.append(fields[1])
+    return {"flows_deleted": flows, "users_terminated": sorted(terminated)}
+
+
+# --- policy -----------------------------------------------------------------------------------
+
+def policy_apply(no_assert: bool = False) -> tuple:
+    cmd = [ln.tool("legatto-policy"), "apply", "--json", "--actor", json.dumps(SYSTEM_ACTOR)]
+    if no_assert:
+        cmd.append("--no-assert")
+    proc = ln.run(cmd, check=False, timeout=180)
+    result = {}
+    if proc.returncode == 0:
+        try:
+            result = json.loads(proc.stdout)
+        except ValueError:
+            result = {}
+    return proc.returncode, result, proc.stderr.strip()[-400:]
+
+
+# --- admin.http (Caddy access log of admin.app.<domain>) ---------------------------------------------
+
+def collect_admin_http(state: dict, v4: list, v6: list) -> None:
+    """Count vendor requests to the admin vhost since the last run (paths only, no content)."""
+    os.makedirs(ln.AUDIT_STATE, mode=0o700, exist_ok=True)
+    cmd = ["journalctl", f"--unit={CADDY_UNIT}", "--output=json", "--no-pager", f"--cursor-file={CADDY_CURSOR}"]
+    if not os.path.exists(CADDY_CURSOR):
+        cmd.append("--since=-2min")
+    proc = ln.run(cmd, check=False, timeout=60)
+    if proc.returncode != 0 or not state.get("active"):
+        return
+    vendor_set = set(v4) | set(v6)
+    paths: dict = {}
+    statuses: dict = {}
+    total = 0
+    for line in proc.stdout.splitlines():
+        try:
+            message = json.loads(line).get("MESSAGE")
+            doc = json.loads(message) if isinstance(message, str) else None
+        except ValueError:
+            continue
+        if not isinstance(doc, dict) or not str(doc.get("logger", "")).startswith(CADDY_ADMIN_LOGGER):
+            continue
+        request = doc.get("request") or {}
+        client = request.get("client_ip") or request.get("remote_ip")
+        if client not in vendor_set:
+            continue
+        total += 1
+        path = str(request.get("uri", "")).split("?", 1)[0][:120] or "/"
+        if path in paths or len(paths) < ADMIN_PATHS_MAX:
+            paths[path] = paths.get(path, 0) + 1
+        else:
+            paths["(other)"] = paths.get("(other)", 0) + 1
+        status = str(doc.get("status", ""))
+        statuses[status] = statuses.get(status, 0) + 1
+    if total:
+        ln.audit_best_effort("admin", "admin.http", SYSTEM_ACTOR, {
+            "window_id": state.get("window_id"), "requests": total, "paths": paths, "statuses": statuses})
+
+
+# --- summary ------------------------------------------------------------------------------------
+
+def read_audit_entries(from_seq: int, to_seq: int | None) -> list:
+    entries = []
+    try:
+        with open(ln.AUDIT_LOG, encoding="utf-8") as fh:
+            for line in fh:
+                try:
+                    entry = json.loads(line)
+                except ValueError:
+                    continue
+                seq = entry.get("seq")
+                if not isinstance(seq, int) or seq < from_seq:
+                    continue
+                if to_seq is not None and seq > to_seq:
+                    break
+                entries.append(entry)
+    except FileNotFoundError:
+        pass
+    return entries
+
+
+def build_summary(state: dict) -> dict:
+    start_seq = state.get("start_seq") or 1
+    end_seq = state.get("end_seq")
+    entries = read_audit_entries(start_seq, end_seq)
+    logins, sudo_cmds, ansible = [], [], []
+    logouts = fails = sudo_count = admin_requests = 0
+    admin_paths: dict = {}
+    for entry in entries:
+        event, params = entry.get("event"), entry.get("params") or {}
+        if event == "ssh.login":
+            logins.append({"ts": entry.get("ts"), "user": params.get("user"), "ip": params.get("ip"),
+                           "node": entry.get("node"), "key_fp": params.get("key_fp")})
+        elif event == "ssh.logout":
+            logouts += 1
+        elif event == "ssh.fail":
+            fails += max(1, int(params.get("suppressed", 0) or 0))
+        elif event == "sudo.command":
+            sudo_count += 1
+            if len(sudo_cmds) < SUMMARY_LIST_MAX:
+                sudo_cmds.append({"ts": entry.get("ts"), "user": params.get("user"),
+                                  "command": params.get("command")})
+        elif event == "admin.http" and params.get("window_id") == state.get("window_id"):
+            admin_requests += int(params.get("requests", 0) or 0)
+            for path, count in (params.get("paths") or {}).items():
+                admin_paths[path] = admin_paths.get(path, 0) + int(count)
+        elif isinstance(event, str) and event.startswith("ansible."):
+            ansible.append({"ts": entry.get("ts"), "event": event, "commit": params.get("commit"),
+                            "plan_sha256": params.get("plan_sha256"), "diff_sha256": params.get("diff_sha256"),
+                            "result": params.get("result")})
+    proc = ln.run([ln.tool("legatto-audit"), "verify", "--json"], check=False, timeout=300)
+    try:
+        verified = json.loads(proc.stdout)
+    except ValueError:
+        verified = {"ok": False, "head": None}
+    return {
+        "v": 1,
+        "window_id": state.get("window_id"),
+        "actor": state.get("actor"),
+        "reason": state.get("reason"),
+        "started_at": state.get("started_at"),
+        "expires_at": state.get("expires_at"),
+        "closed_at": state.get("closed_at"),
+        "close_reason": state.get("close_reason"),
+        "ssh": {"logins": logins, "logouts": logouts, "fails": fails},
+        "sudo": {"count": sudo_count, "commands": sudo_cmds, "truncated": sudo_count > len(sudo_cmds)},
+        "admin_http": {"requests": admin_requests, "paths": admin_paths},
+        "ansible": ansible,
+        "audit": {"from_seq": start_seq, "to_seq": end_seq if end_seq else (entries[-1]["seq"] if entries else None),
+                  "head": verified.get("head"), "chain_ok": bool(verified.get("ok"))},
+    }
+
+
+def write_summary(state: dict) -> str:
+    summary = build_summary(state)
+    path = os.path.join(SUMMARIES, f"{state['window_id']}.json")
+    ln.write_json(path, summary, 0o640, ln.CONSOLE_GROUP)
+    return path
+
+
+# --- transitions -------------------------------------------------------------------------------
+
+def validate_reason(reason: str, minimum: int) -> str:
+    reason = reason.strip()
+    if not minimum <= len(reason) <= REASON_MAX:
+        raise ln.ToolError(f"--reason must have {minimum}-{REASON_MAX} characters", ln.EXIT_ARGS)
+    if any(ord(ch) < 32 or ord(ch) == 127 for ch in reason):
+        raise ln.ToolError("--reason must be plain text without control characters", ln.EXIT_ARGS)
+    return reason
+
+
+def close_window(state: dict, actor: dict, reason: str, close_reason: str) -> tuple:
+    """Close an active window. Returns (exit_code, result)."""
+    event = "breakglass.expire" if close_reason == "expired" else "breakglass.disable"
+    errors = []
+    v4, v6, _fresh = vendor_addresses()
+    try:
+        collect_admin_http(state, v4, v6)
+    except ln.ToolError as exc:
+        ln.warn(f"admin.http collection: {exc}")
+    state.update({"active": False, "closed_at": ln.fmt_ts(ln.now()), "close_reason": close_reason,
+                  "closed_by": actor})
+    save_state(state)
+    # 1. hard cut in the kernel first, independent of Headscale
+    try:
+        apply_sets(v4, v6, 0)
+    except ln.ToolError as exc:
+        errors.append(f"nft: {exc}")
+        try:
+            flush_window_sets()
+        except ln.ToolError as exc2:
+            errors.append(f"nft flush: {exc2}")
+    # 2. live sessions
+    cut = cut_sessions(v4, v6)
+    # 3. Headscale policy back to normal, asserted on the server PacketFilter
+    rc, result, detail = policy_apply()
+    if rc != 0:
+        errors.append(f"legatto-policy apply exit {rc}: {detail}")
+    entry = ln.audit_best_effort("breakglass", event, actor, {
+        "window_id": state.get("window_id"), "reason": reason, "close_reason": close_reason,
+        "policy_ok": rc == 0, **cut})
+    if entry:
+        state["end_seq"] = entry["seq"]
+    if errors:
+        state["last_error"] = "; ".join(errors)[:500]
+        ln.audit_best_effort("breakglass", "breakglass.error", SYSTEM_ACTOR, {
+            "window_id": state.get("window_id"), "stage": close_reason, "errors": state["last_error"]})
+    else:
+        state.pop("last_error", None)
+    save_state(state)
+    summary_path = None
+    try:
+        summary_path = write_summary(state)
+    except (ln.ToolError, OSError) as exc:
+        ln.warn(f"summary: {exc}")
+    publish_status(state, ok=not errors)
+    out = {"window_id": state.get("window_id"), "closed_at": state["closed_at"], "close_reason": close_reason,
+           "summary_path": summary_path, "policy": result, **cut}
+    return (EXIT_ASSERT if errors else ln.EXIT_OK), out
+
+
+def cmd_enable(args: argparse.Namespace) -> tuple:
+    ln.require_root()
+    actor = ln.parse_actor(args.actor)
+    if not HOURS_MIN <= args.hours <= HOURS_MAX:
+        raise ln.ToolError(f"--hours must be {HOURS_MIN}-{HOURS_MAX}", ln.EXIT_ARGS)
+    reason = validate_reason(args.reason, REASON_MIN)
+    with ln.FileLock(LOCK):
+        state = load_state()
+        if state.get("active"):
+            if not window_expired(state):
+                return EXIT_STATE, {"error": "window already active", **status_doc(state)}
+            close_window(state, SYSTEM_ACTOR, "expired before a new window", "expired")
+        started = ln.now()
+        state = {
+            "v": 1, "active": True,
+            "window_id": started.strftime("%Y%m%dT%H%M%SZ") + "-" + secrets.token_hex(3),
+            "actor": actor, "reason": reason,
+            "started_at": ln.fmt_ts(started), "expires_at": ln.fmt_ts(started + ln.hours(args.hours)),
+            "hours": args.hours,
+        }
+        # No access without a trace: the audit entry comes first and is mandatory.
+        entry = ln.audit("breakglass", "breakglass.enable", actor, {
+            "window_id": state["window_id"], "hours": args.hours, "reason": reason,
+            "expires_at": state["expires_at"]})
+        state["start_seq"] = entry["seq"]
+        save_state(state)
+        v4, v6, _fresh = vendor_addresses()
+        try:
+            apply_sets(v4, v6, seconds_left(state))
+        except ln.ToolError as exc:
+            ln.warn(f"nft: {exc}")
+        rc, result, detail = policy_apply()
+        if rc == 22 or (rc not in (0, 23)):
+            # The window cannot be granted: close it again, cleanly and audited.
+            ln.audit_best_effort("breakglass", "breakglass.error", SYSTEM_ACTOR, {
+                "window_id": state["window_id"], "stage": "enable", "errors": f"policy exit {rc}: {detail}"})
+            _code, closed = close_window(state, SYSTEM_ACTOR, "policy could not be applied", "error")
+            return EXIT_ASSERT, {"error": "policy could not be applied", **closed}
+        asserted = rc == 0
+        if not asserted:
+            state["last_error"] = f"assert: {detail}"[:500]
+            ln.audit_best_effort("breakglass", "breakglass.error", SYSTEM_ACTOR, {
+                "window_id": state["window_id"], "stage": "enable-assert", "errors": state["last_error"]})
+            save_state(state)
+        publish_status(state, ok=asserted)
+        out = {"window_id": state["window_id"], "started_at": state["started_at"],
+               "expires_at": state["expires_at"], "policy_asserted": asserted, "policy": result}
+        return (ln.EXIT_OK if asserted else EXIT_ASSERT), out
+
+
+def cmd_disable(args: argparse.Namespace) -> tuple:
+    ln.require_root()
+    actor = ln.parse_actor(args.actor)
+    reason = validate_reason(args.reason or "", 0)
+    with ln.FileLock(LOCK):
+        state = load_state()
+        if not state.get("active"):
+            # Nothing open; still make sure nothing is left open by mistake.
+            reconcile(state, sets_only=False)
+            return EXIT_STATE, {"error": "no active window", **status_doc(load_state())}
+        return close_window(state, actor, reason, "disabled")
+
+
+def reconcile(state: dict, sets_only: bool) -> tuple:
+    if state.get("active") and window_expired(state) and not sets_only:
+        code, out = close_window(state, SYSTEM_ACTOR, "window expired", "expired")
+        return code, {"action": "expired", **out}
+    active = bool(state.get("active")) and not window_expired(state)
+    v4, v6, fresh = vendor_addresses()
+    drift = []
+    if not active and window_sets_nonempty():
+        drift.append("nft window sets not empty outside a window")
+    window_seconds = seconds_left(state) if active else 0
+    errors = []
+    try:
+        apply_sets(v4, v6, window_seconds)
+    except ln.ToolError as exc:
+        errors.append(f"nft: {exc}")
+    result = {"action": "sets", "active": active, "vendor4": len(v4), "vendor6": len(v6),
+              "window_seconds": window_seconds, "headscale": fresh}
+    if not sets_only:
+        rc, policy, detail = policy_apply()
+        if policy.get("changed"):
+            drift.append(f"headscale policy differed from variant {policy.get('variant')}")
+        if rc != 0:
+            errors.append(f"legatto-policy apply exit {rc}: {detail}")
+        try:
+            collect_admin_http(state, v4, v6)
+        except ln.ToolError as exc:
+            ln.warn(f"admin.http collection: {exc}")
+        result["policy"] = policy
+    if drift:
+        ln.audit_best_effort("breakglass", "breakglass.drift", SYSTEM_ACTOR, {
+            "window_id": state.get("window_id") if active else None, "drift": drift})
+        result["drift"] = drift
+    error_text = "; ".join(errors)[:500] if errors else None
+    if error_text != state.get("last_error") and not sets_only:
+        if error_text:
+            ln.audit_best_effort("breakglass", "breakglass.error", SYSTEM_ACTOR, {
+                "window_id": state.get("window_id") if active else None, "stage": "reconcile",
+                "errors": error_text})
+            state["last_error"] = error_text
+        else:
+            state.pop("last_error", None)
+        if os.path.exists(STATE) or error_text:
+            save_state(state)
+    publish_status(state, ok=not errors)
+    return (EXIT_ASSERT if errors and not sets_only else ln.EXIT_OK), result
+
+
+def cmd_reconcile(args: argparse.Namespace) -> tuple:
+    ln.require_root()
+    with ln.FileLock(LOCK, timeout=50):
+        return reconcile(load_state(), args.sets_only)
+
+
+def cmd_status(_args: argparse.Namespace) -> tuple:
+    return ln.EXIT_OK, status_doc(load_state())
+
+
+def cmd_summary(args: argparse.Namespace) -> tuple:
+    if not WINDOW_ID_RE.match(args.window):
+        raise ln.ToolError("--window must be a window id", ln.EXIT_ARGS)
+    stored = ln.read_json(os.path.join(SUMMARIES, f"{args.window}.json"))
+    if isinstance(stored, dict):
+        return ln.EXIT_OK, stored
+    state = load_state()
+    if state.get("window_id") == args.window:
+        return ln.EXIT_OK, build_summary(state)
+    raise ln.ToolError(f"unknown window {args.window}", ln.EXIT_ARGS)
+
+
+def build_parser() -> argparse.ArgumentParser:
+    parser = argparse.ArgumentParser(prog="legatto-breakglass", description="vendor service window")
+    sub = parser.add_subparsers(dest="cmd", required=True)
+    p = sub.add_parser("enable")
+    p.add_argument("--hours", type=int, required=True)
+    p.add_argument("--reason", required=True)
+    p.add_argument("--actor", required=True)
+    p.add_argument("--json", action="store_true")
+    p = sub.add_parser("disable")
+    p.add_argument("--reason", default="")
+    p.add_argument("--actor", required=True)
+    p.add_argument("--json", action="store_true")
+    p = sub.add_parser("reconcile")
+    p.add_argument("--sets-only", action="store_true")
+    p.add_argument("--json", action="store_true")
+    p = sub.add_parser("status")
+    p.add_argument("--json", action="store_true")
+    p = sub.add_parser("summary")
+    p.add_argument("--window", required=True)
+    p.add_argument("--json", action="store_true")
+    return parser
+
+
+def main(argv: list) -> int:
+    try:
+        args = build_parser().parse_args(argv)
+    except SystemExit as exc:
+        return ln.EXIT_ARGS if exc.code else ln.EXIT_OK
+    handlers = {"enable": cmd_enable, "disable": cmd_disable, "reconcile": cmd_reconcile,
+                "status": cmd_status, "summary": cmd_summary}
+    try:
+        code, result = handlers[args.cmd](args)
+    except ln.ToolError as exc:
+        ln.warn(str(exc))
+        return exc.code
+    except OSError as exc:
+        ln.warn(str(exc))
+        return ln.EXIT_ERR
+    text = json.dumps(result, sort_keys=True, ensure_ascii=False)
+    print(text, file=sys.stdout if args.json else sys.stderr)
+    return code
+
+
+if __name__ == "__main__":
+    sys.exit(main(sys.argv[1:]))

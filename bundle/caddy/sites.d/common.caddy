@@ -1,0 +1,79 @@
+# Snippets shared by crm.caddy, admin.caddy and studio.caddy. Imported at the top
+# level of the global /etc/caddy/Caddyfile (Ansible, role proxy) before the site
+# blocks. Release-delivered (applier caddy-site): only snippets here, no site
+# addresses, no `bind`, no global options.
+
+# Response headers from legatto-app vercel.json "headers". The Node server sets the
+# same values on its own responses; `?` only fills in what a response lacks (api-gw,
+# Caddy errors, the office console), so the app stays the source of truth.
+# tests/platform keeps this list equal to vercel.json.
+(legatto_vercel_headers) {
+	header {
+		?X-Frame-Options "DENY"
+		?X-Content-Type-Options "nosniff"
+		?Referrer-Policy "strict-origin-when-cross-origin"
+		?Strict-Transport-Security "max-age=63072000"
+		?Permissions-Policy "camera=(), microphone=(), geolocation=(), interest-cohort=()"
+		?Cross-Origin-Opener-Policy "same-origin"
+		-Server
+	}
+	@legatto_newsletter path /n/* /api/newsletter-view
+	@legatto_fonts path /fonts/newsletter/*
+	@legatto_app_csp not path /n/* /api/newsletter-view
+	@legatto_same_origin_corp not path /fonts/newsletter/*
+	header @legatto_app_csp ?Content-Security-Policy "script-src 'self' https://challenges.cloudflare.com; object-src 'none'; base-uri 'none'; form-action 'self'; frame-ancestors 'none'; worker-src 'self'; manifest-src 'self'"
+	header @legatto_newsletter ?Content-Security-Policy "sandbox; default-src 'none'; img-src https: data:; style-src 'unsafe-inline'; font-src https: data:; base-uri 'none'; form-action 'none'; frame-ancestors 'none'"
+	header @legatto_same_origin_corp ?Cross-Origin-Resource-Policy "same-origin"
+	header @legatto_fonts {
+		?Access-Control-Allow-Origin "*"
+		?Cross-Origin-Resource-Policy "cross-origin"
+	}
+}
+
+# Refuse ambiguous paths before any routing decision: dot segments, empty
+# segments, backslashes and encoded separators could make Caddy and Envoy
+# disagree about which prefix a request belongs to. Matched on the raw request
+# URI (path part only): Caddy's path matchers see the cleaned, unescaped path.
+(legatto_path_guard) {
+	@legatto_bad_path expression `{http.request.orig_uri}.matches("^[^?]*(?:(?i:%(?:2e|2f|5c|00))|/\\.\\.?(?:/|\\?|$)|//|\\\\)")`
+	handle @legatto_bad_path {
+		respond 400
+	}
+}
+
+# Supabase routes. Only these prefixes reach api-gw (Envoy); everything else goes
+# to the app. Never to api-gw from app./admin.: "/" (Studio), /pg/ (meta),
+# /mcp and /api/mcp (Studio MCP), /graphql/v1, /realtime/v1/api, /storage/v1/s3,
+# /auth/v1/admin (service-role API; admin functions call it inside legatto-int).
+(legatto_supabase_routes) {
+	@legatto_sb_block path /auth/v1/admin /auth/v1/admin/* /realtime/v1/api /realtime/v1/api/* /storage/v1/s3 /storage/v1/s3/* /graphql/v1 /graphql/v1/*
+	@legatto_sb path /auth/v1/* /rest/v1/* /storage/v1/object/* /storage/v1/bucket /storage/v1/bucket/* /storage/v1/upload/* /realtime/v1/websocket /realtime/v1/websocket/* /functions/v1/*
+	handle @legatto_sb_block {
+		respond 404
+	}
+	handle @legatto_sb {
+		reverse_proxy 172.30.0.11:8000 {
+			header_up X-Forwarded-Proto https
+			header_up X-Legatto-Surface {args[0]}
+			transport http {
+				# edge-runtime user worker idle timeout is 150 s
+				response_header_timeout 160s
+			}
+		}
+	}
+}
+
+# Everything else: the legatto-app Node server (SPA, /api/**, /runtime-config.js).
+(legatto_app_route) {
+	handle {
+		reverse_proxy 172.30.0.10:3000 {
+			header_up X-Legatto-Surface {args[0]}
+			# server-sent events (PoliAI)
+			flush_interval -1
+			transport http {
+				# longest vercel.json maxDuration is 300 s
+				response_header_timeout 305s
+			}
+		}
+	}
+}

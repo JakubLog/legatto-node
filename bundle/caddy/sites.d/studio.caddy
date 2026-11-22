@@ -1,0 +1,22 @@
+# studio.app.<domain> — Supabase Studio on demand (tailnet IPv6; ACL: office devices
+# and vendor break-glass only). Studio and meta run only while `legatto-studio enable`
+# holds a window (compose profile admin); Envoy keeps its basic auth (DASHBOARD_*)
+# in front of "/". Body of the site block defined in the global Caddyfile.
+
+header {
+	?Strict-Transport-Security "max-age=63072000"
+	?X-Content-Type-Options "nosniff"
+	?X-Frame-Options "DENY"
+	?Referrer-Policy "no-referrer"
+	-Server
+}
+import legatto_path_guard
+handle {
+	reverse_proxy 172.30.0.11:8000 {
+		header_up X-Forwarded-Proto https
+		header_up X-Legatto-Surface studio
+		transport http {
+			response_header_timeout 160s
+		}
+	}
+}

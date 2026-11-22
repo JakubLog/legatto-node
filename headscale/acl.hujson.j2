@@ -1,0 +1,60 @@
+{#-
+  Headscale policy of one office (grants syntax, Headscale >= 0.29).
+
+  Rendered ON THE SERVER by `legatto-policy render` (jinja2 SandboxedEnvironment,
+  StrictUndefined) into /etc/legatto/policy/{normal,breakglass}.hujson; the
+  active variant is copied atomically to /etc/headscale/policy.hujson. Ansible
+  installs this file unchanged to /etc/legatto/policy/acl.hujson.j2.
+
+  Context (validated by legatto-policy before rendering):
+    staff      logins from /var/lib/legatto/tailnet/staff.json (office console)
+    vendors    v-<name> logins from /etc/legatto/policy/static.json (Ansible)
+    ts_ip4     server tailnet IPv4: crm (tcp/443) and ssh (tcp/22)
+    ts_ip6     server tailnet IPv6: admin + studio (tcp/443)
+    tags       {server, office_device}
+    groups     {staff, vendor}
+    ports      {ssh, https}
+    breakglass true only in the break-glass variant
+    window     {window_id, expires_at} of the active window, or none
+
+  Rules (spec + PLAN D4): staff -> crm; office devices -> crm + admin;
+  vendors -> ssh + admin only inside a break-glass window. Nothing else:
+  tag:server is never a source, so a compromised server cannot open
+  connections to staff devices, and there is no traffic between users.
+  The `tests` block is deliberately absent: a test whose source has no nodes
+  makes `headscale policy check` fail, which could block closing a window.
+  The policy tests run in CI (tests/acl) against a throw-away Headscale.
+-#}
+// Rendered on the server by legatto-policy from acl.hujson.j2. Do not edit by hand.
+// Variant: {{ "breakglass" if breakglass else "normal" }}
+{
+  "groups": {
+    {{ groups.staff | tojson }}: {{ staff | map("tailnet_user") | list | tojson }},
+    {{ groups.vendor | tojson }}: {{ vendors | map("tailnet_user") | list | tojson }},
+  },
+  // Only root on the server (headscale CLI) mints tagged pre-auth keys.
+  "tagOwners": {
+    {{ tags.server | tojson }}: [],
+    {{ tags.office_device | tojson }}: [],
+  },
+  "hosts": {
+    "crm": {{ (ts_ip4 ~ "/32") | tojson }},
+    // admin.app.<domain> and studio.app.<domain> share the IPv6 listener.
+    "admin": {{ (ts_ip6 ~ "/128") | tojson }},
+    "ssh": {{ (ts_ip4 ~ "/32") | tojson }},
+  },
+  "grants": [
+    {"src": [{{ groups.staff | tojson }}], "dst": ["crm"], "ip": [{{ ("tcp:" ~ ports.https) | tojson }}]},
+    {"src": [{{ tags.office_device | tojson }}], "dst": ["crm", "admin"], "ip": [{{ ("tcp:" ~ ports.https) | tojson }}]},
+{%- if breakglass %}
+    // BREAK-GLASS window {{ window.window_id if window else "pending" }} until {{ window.expires_at if window else "-" }}
+    // (actor and reason: /var/log/legatto/audit.log)
+    {"src": [{{ groups.vendor | tojson }}], "dst": ["ssh"], "ip": [{{ ("tcp:" ~ ports.ssh) | tojson }}]},
+    {"src": [{{ groups.vendor | tojson }}], "dst": ["admin"], "ip": [{{ ("tcp:" ~ ports.https) | tojson }}]},
+{%- endif %}
+  ],
+  // Tailscale SSH is not used; OpenSSH listens on the server's tailnet IPv4.
+  "ssh": [],
+  // Keep WireGuard on the fixed port 41641 (firewall rule).
+  "randomizeClientPort": false,
+}

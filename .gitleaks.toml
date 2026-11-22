@@ -1,0 +1,15 @@
+title = "legatto-infra"
+
+[extend]
+useDefault = true
+
+[[allowlists]]
+description = "Third-party Ansible collections installed by make collections (gitignored, upstream test fixtures)"
+paths = ['''^ansible/collections/''']
+
+[[allowlists]]
+description = "Unmodified upstream Supabase docker/ (self-hosted/v0.8.4): public example JWTs and test keys, never deployed as secrets"
+paths = [
+  '''^bundle/compose/supabase/\.env\.example$''',
+  '''^bundle/compose/supabase/tests/''',
+]

@@ -1,0 +1,12 @@
+# vercel.json cron /api/cron/notifications, schedule "0 5 * * *" (UTC, Vercel semantics).
+[Unit]
+Description=Legatto app cron notifications (daily 05:00 UTC)
+
+[Timer]
+OnCalendar=*-*-* 05:00:00 UTC
+Persistent=true
+AccuracySec=1min
+Unit=legatto-cron@notifications.service
+
+[Install]
+WantedBy=timers.target

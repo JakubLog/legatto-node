@@ -1,0 +1,27 @@
+# admin.app.<domain> — office admin surface (tailnet IPv6; ACL: office devices and
+# vendor break-glass only). Body of the site block defined in the global Caddyfile.
+# Release-delivered (applier caddy-site): no site address, no `bind`.
+
+import legatto_vercel_headers
+request_body {
+	max_size 52MB
+}
+import legatto_path_guard
+# Every `handle` uses a named matcher (kept in written order, before any
+# path-matcher handle). Office console (lane console) on a unix socket; it serves
+# under /console/.
+redir /console /console/ 308
+@legatto_console path /console/*
+handle @legatto_console {
+	reverse_proxy unix//run/legatto/office-console.sock {
+		header_up X-Legatto-Surface admin
+	}
+}
+# Superseded by the public-site intake (PLAN A7).
+@legatto_retired path /functions/v1/public-submit-case
+handle @legatto_retired {
+	respond 404
+}
+
+import legatto_supabase_routes admin
+import legatto_app_route admin

@@ -1,0 +1,16 @@
+# secrets — never commit plaintext
+*.decrypted.*
+*.plain.*
+.env
+.env.*
+*.age-identity
+recovery-pack/
+# node / wrangler
+node_modules/
+.wrangler/
+dist/
+# unmodified upstream Supabase example env (vendored, public demo values)
+!bundle/compose/supabase/.env.example
+# python bytecode
+__pycache__/
+*.pyc

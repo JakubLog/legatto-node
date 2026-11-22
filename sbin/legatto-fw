@@ -1,0 +1,172 @@
+#!/usr/bin/python3
+"""legatto-fw-apply / legatto-fw-confirm / legatto-fw-rollback (CONTRACT §4.6).
+
+Safe replacement of the `inet legatto` rules with automatic rollback:
+
+  legatto-fw-apply NEW     nft -c NEW; dump the live table to rollback.nft;
+                           arm legatto-fw-rollback (systemd-run, 120 s); load NEW;
+                           refill the break-glass/vendor sets
+  legatto-fw-confirm NEW   from a NEW connection: install NEW as /etc/nftables.conf,
+                           disarm the rollback
+  legatto-fw-rollback      (timer or by hand) reload rollback.nft
+
+/etc/nftables.conf changes only on confirm, so a reboot during the 120 s also
+returns to the last confirmed rules. One file, three names (argv[0]).
+Exit codes: 0 OK, 1 error, 2 bad arguments, 3 lock busy, 4 precondition,
+25 `nft -c` rejected the file.
+"""
+
+from __future__ import annotations
+
+import hashlib
+import json
+import os
+import sys
+from datetime import timedelta
+
+if os.environ.get("LEGATTO_TEST_ROOT") and os.environ.get("LEGATTO_NET_LIB"):
+    sys.path.insert(0, os.environ["LEGATTO_NET_LIB"])
+sys.path.insert(1, os.path.join(os.path.dirname(os.path.realpath(__file__)), "..", "lib", "net"))
+import legatto_net as ln  # noqa: E402
+
+EXIT_NFT_CHECK = 25
+CONFIRM_TIMEOUT_S = 120  # contract: legatto_breakglass.fw_confirm_timeout_seconds
+ROLLBACK_SERVICE = "legatto-fw-rollback.service"  # contract: legatto_units.fw_rollback
+ROLLBACK_UNIT = ROLLBACK_SERVICE.removesuffix(".service")  # systemd-run --unit adds .service/.timer
+PENDING = os.path.join(ln.FW_RUN, "pending.json")
+ROLLBACK_FILE = os.path.join(ln.FW_RUN, "rollback.nft")
+LOCK = os.path.join(ln.FW_RUN, "fw.lock")
+SYSTEM_ACTOR = {"kind": "system", "id": "legatto-fw"}
+TABLE = f"{ln.NFT_FAMILY} {ln.NFT_TABLE}"
+
+
+def sha256_file(path: str) -> str:
+    digest = hashlib.sha256()
+    with open(path, "rb") as fh:
+        for block in iter(lambda: fh.read(65536), b""):
+            digest.update(block)
+    return digest.hexdigest()
+
+
+def nft_check(path: str) -> None:
+    proc = ln.run(["nft", "-c", "-f", path], check=False, timeout=30)
+    if proc.returncode != 0:
+        raise ln.ToolError(f"nft -c rejected {path}: {proc.stderr.strip()[-400:]}", EXIT_NFT_CHECK)
+
+
+def refill_sets() -> None:
+    """Loading the file recreates the table with empty sets; refill them."""
+    breakglass = ln.tool("legatto-breakglass")
+    if not os.path.exists(breakglass):
+        ln.warn("legatto-breakglass not installed yet; vendor/window sets stay empty")
+        return
+    proc = ln.run([breakglass, "reconcile", "--sets-only"], check=False, timeout=60)
+    if proc.returncode != 0:
+        ln.warn(f"reconcile --sets-only exit {proc.returncode}: {proc.stderr.strip()[-200:]}")
+
+
+def audit(event: str, params: dict) -> None:
+    if os.path.exists(ln.tool("legatto-audit")):
+        ln.audit_best_effort("fw", event, SYSTEM_ACTOR, params)
+
+
+def disarm() -> None:
+    ln.run(["systemctl", "stop", f"{ROLLBACK_UNIT}.timer"], check=False, timeout=30)
+    ln.run(["systemctl", "reset-failed", f"{ROLLBACK_UNIT}.service", f"{ROLLBACK_UNIT}.timer"], check=False,
+           timeout=30)
+
+
+def fw_apply(new: str) -> dict:
+    if not os.path.isfile(new):
+        raise ln.ToolError(f"{new}: no such file", ln.EXIT_ARGS)
+    nft_check(new)
+    os.makedirs(ln.FW_RUN, mode=0o700, exist_ok=True)
+    with ln.FileLock(LOCK):
+        live = ln.run(["nft", "list", "table", *TABLE.split()], check=False, timeout=30)
+        rollback = f"table {TABLE}\ndelete table {TABLE}\n"
+        if live.returncode == 0:
+            rollback += live.stdout
+        ln.atomic_write(ROLLBACK_FILE, rollback.encode("utf-8"), 0o600, None)
+        disarm()
+        ln.run(["systemd-run", f"--unit={ROLLBACK_UNIT}", f"--on-active={CONFIRM_TIMEOUT_S}",
+                "--timer-property=AccuracySec=1s", "--property=Type=oneshot", "--collect",
+                "--description=legatto: roll back unconfirmed nftables rules", ln.tool("legatto-fw-rollback")])
+        new_sha = sha256_file(new)
+        deadline = ln.fmt_ts(ln.now() + timedelta(seconds=CONFIRM_TIMEOUT_S))
+        ln.write_json(PENDING, {"v": 1, "new": os.path.abspath(new), "sha256": new_sha,
+                                "applied_at": ln.fmt_ts(ln.now()), "rollback_at": deadline}, 0o600)
+        proc = ln.run(["nft", "-f", new], check=False, timeout=30)
+        if proc.returncode != 0:
+            # Nothing was loaded (nft transactions are atomic); nothing to roll back.
+            os.unlink(PENDING)
+            disarm()
+            raise ln.ToolError(f"nft -f {new} failed: {proc.stderr.strip()[-400:]}")
+        refill_sets()
+    audit("fw.apply", {"sha256": new_sha, "rollback_in_s": CONFIRM_TIMEOUT_S})
+    return {"applied": new_sha, "rollback_at": deadline}
+
+
+def fw_confirm(new: str) -> dict:
+    with ln.FileLock(LOCK):
+        pending = ln.read_json(PENDING)
+        if not isinstance(pending, dict):
+            raise ln.ToolError("nothing to confirm (no pending rules or already rolled back)", ln.EXIT_PRECOND)
+        new_sha = sha256_file(new)
+        if new_sha != pending.get("sha256"):
+            raise ln.ToolError("file differs from the applied rules", ln.EXIT_PRECOND)
+        with open(new, "rb") as fh:
+            ln.atomic_write(ln.NFT_MAIN, fh.read(), 0o644, None)
+        disarm()
+        os.unlink(PENDING)
+    audit("fw.confirm", {"sha256": new_sha})
+    return {"confirmed": new_sha, "installed": ln.NFT_MAIN}
+
+
+def fw_rollback() -> dict:
+    with ln.FileLock(LOCK, timeout=60):
+        pending = ln.read_json(PENDING)
+        if not isinstance(pending, dict):
+            return {"rolled_back": False, "reason": "nothing pending"}
+        proc = ln.run(["nft", "-f", ROLLBACK_FILE], check=False, timeout=30)
+        if proc.returncode != 0:
+            ln.warn(f"rollback load failed, falling back to {ln.NFT_MAIN}: {proc.stderr.strip()[-200:]}")
+            ln.run(["nft", "-f", ln.NFT_MAIN], timeout=30)
+        refill_sets()
+        os.unlink(PENDING)
+        disarm()
+    audit("fw.rollback", {"sha256": pending.get("sha256"), "applied_at": pending.get("applied_at")})
+    return {"rolled_back": True, "sha256": pending.get("sha256")}
+
+
+def main(argv: list) -> int:
+    name = os.path.basename(sys.argv[0])
+    action = {"legatto-fw-apply": "apply", "legatto-fw-confirm": "confirm",
+              "legatto-fw-rollback": "rollback"}.get(name)
+    if action is None and argv and argv[0] in ("apply", "confirm", "rollback"):
+        action, argv = argv[0], argv[1:]
+    as_json = "--json" in argv
+    argv = [a for a in argv if a != "--json"]
+    if action is None or (action in ("apply", "confirm") and len(argv) != 1) or (action == "rollback" and argv):
+        print("usage: legatto-fw-apply NEW | legatto-fw-confirm NEW | legatto-fw-rollback  [--json]",
+              file=sys.stderr)
+        return ln.EXIT_ARGS
+    try:
+        ln.require_root()
+        if action == "apply":
+            result = fw_apply(argv[0])
+        elif action == "confirm":
+            result = fw_confirm(argv[0])
+        else:
+            result = fw_rollback()
+    except ln.ToolError as exc:
+        ln.warn(str(exc))
+        return exc.code
+    except OSError as exc:
+        ln.warn(str(exc))
+        return ln.EXIT_ERR
+    print(json.dumps(result, sort_keys=True), file=sys.stdout if as_json else sys.stderr)
+    return ln.EXIT_OK
+
+
+if __name__ == "__main__":
+    sys.exit(main(sys.argv[1:]))

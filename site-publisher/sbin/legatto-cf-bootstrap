@@ -1,0 +1,10 @@
+#!/usr/bin/python3 -I
+"""legatto-cf-bootstrap — see legatto_publicsite/cf_bootstrap.py. Installed in /opt/legatto/sbin next to the package."""
+import os
+import sys
+
+sys.path.insert(0, os.path.dirname(os.path.realpath(__file__)))
+
+from legatto_publicsite import cf_bootstrap  # noqa: E402
+
+sys.exit(cf_bootstrap.main())

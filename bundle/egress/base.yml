@@ -1,0 +1,39 @@
+---
+# Egress allowlist: always-on entries per role (PLAN D9, R3). Owner: egress lane.
+#
+# Data only. release/build.sh copies `roles` into manifest.egress.roles; the
+# server reads it back from the signed manifest (legatto-egress render/diff).
+# Any added (role, host, port) holds the whole release until the office admin
+# approves it in the console; removals install automatically, except entries
+# that are pinned on the server (/etc/legatto/egress/pinned.json -> exit 41).
+#
+# Rules (enforced by `legatto-egress validate-data` and on the server):
+#   - host: exact lowercase name, or one leading "*." wildcard whose base has
+#     at least three labels and is not a multi-tenant suffix; never an IP;
+#   - port: 443, or 80 for signed APT repositories only;
+#   - role: host | app | auth | functions | intake | publish.
+# Office-specific names (Uptime Kuma host, the MP's site) are not release
+# data: Ansible writes them to pinned.json / config.json on the server.
+version: 1
+roles:
+  host:
+    # legatto-update (root) -> signed index, manifests and artifacts.
+    - {host: updates.legatto.pl, port: 443, purpose: "release server (legatto-update)"}
+    # apt / unattended-upgrades (_apt). Repositories are GPG-signed, plain HTTP.
+    - {host: archive.ubuntu.com, port: 80, purpose: "Ubuntu archive (apt)"}
+    - {host: security.ubuntu.com, port: 80, purpose: "Ubuntu security updates (apt)"}
+    # Docker Engine: versions pinned in versions.yml, installed by the docker
+    # role in a break-glass window (signed APT repository over HTTPS).
+    - {host: download.docker.com, port: 443, purpose: "Docker Engine APT repository (pinned versions, docker role)"}
+    # lego (legatto-acme) DNS-01 and Headscale autocert TLS-ALPN-01.
+    - {host: acme-v02.api.letsencrypt.org, port: 443, purpose: "Let's Encrypt ACME (lego, Headscale)"}
+    # lego DNS-01 in the office zone; cf_bootstrap during a break-glass window.
+    - {host: api.cloudflare.com, port: 443, purpose: "Cloudflare API: DNS-01 records, account bootstrap"}
+  app:
+    # Auth e-mails (invitations, password reset, magic link) go GoTrue hook ->
+    # app -> Resend (U9), so this entry is independent of the `email` feature.
+    - {host: api.resend.com, port: 443, purpose: "Resend API: auth e-mails from the office domain (U9)"}
+  intake:
+    - {host: api.cloudflare.com, port: 443, purpose: "Cloudflare Queues pull/ack (intake fetcher)"}
+  publish:
+    - {host: api.cloudflare.com, port: 443, purpose: "Cloudflare Pages Direct Upload and Workers versions/deployments"}

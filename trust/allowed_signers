@@ -1,0 +1,19 @@
+# Release trust anchors of production office servers (legatto_env: prod).
+# Installed to /etc/legatto/update/allowed_signers by the `updater` role,
+# only inside a break-glass window; a release can never change this file.
+#
+# Format (ssh-keygen(1) ALLOWED SIGNERS), one key per line:
+#   release-a@legatto.pl namespaces="legatto-release,legatto-promote,legatto-index,legatto-revoke" sk-ssh-ed25519@openssh.com AAAA...
+#   release-b@legatto.pl namespaces="legatto-release,legatto-promote,legatto-index,legatto-revoke" sk-ssh-ed25519@openssh.com AAAA...
+#   canary@legatto.pl namespaces="legatto-canary" ssh-ed25519 AAAA...
+#
+# release-a: the release YubiKey (FIDO2, resident, verify-required). Public
+#   half: `ssh-keygen -K` on the signing machine, then the .pub of id_ed25519_sk_rk.
+# release-b: offline backup key (U8); added when it is bought.
+# canary: printed by the `updater` role on the canary server
+#   ("Show the allowed_signers line of this canary server").
+#
+# The role refuses legatto_env=prod until this file lists at least
+# signatures_required release principals, all of type sk-ssh-ed25519.
+# Software keys for tests live only in legatto-offices inventories with
+# legatto_env: test (legatto_update_allowed_signers_src).

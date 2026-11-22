@@ -1,0 +1,1426 @@
+#!/usr/bin/python3
+"""legatto-egress: egress allowlist renderer and enforcer (PLAN D9, R3).
+
+Mechanism lives on the host (installed by the Ansible role `egress` in a
+break-glass window); the signed release carries only data: `manifest.egress`
+with hostnames per role and per feature. This tool turns that data, the office
+feature flags and the Ansible-owned pinned entries into:
+
+  * Smokescreen configs and ACLs: the host proxy (127.0.0.1:4750) and one
+    proxy per container role (egress-<role>, compose);
+  * /etc/nftables.d/egress.nft: rules for the `egress_out` / `egress_fwd`
+    chains of `table inet legatto` (per-user host egress, proxy uplinks);
+
+and computes the difference between two releases (widening needs the office
+admin's approval, removing a pinned entry is refused).
+
+Python 3.12 standard library only (CONTRACT §1.5). Subcommands and exit codes:
+CONTRACT §4.6. Contract values come from /etc/legatto/egress/config.json,
+rendered by the role from contract.yml.
+"""
+
+from __future__ import annotations
+
+import argparse
+import contextlib
+import datetime as dt
+import errno
+import fcntl
+import grp
+import hashlib
+import ipaddress
+import json
+import os
+import pwd
+import re
+import shutil
+import socket
+import subprocess
+import sys
+import tempfile
+import time
+from pathlib import Path
+from typing import Any, Iterable
+
+VERSION = "1.0.0"
+GENERATOR = f"legatto-egress {VERSION}"
+
+# contract: legatto_paths.egress_etc + "/config.json" (rendered by role egress)
+DEFAULT_CONFIG = "/etc/legatto/egress/config.json"
+CONFIG_ENV = "LEGATTO_EGRESS_CONFIG"
+
+TEMPLATE_DIR = Path(__file__).resolve().parent / "templates"
+
+EXIT_OK = 0
+EXIT_ERROR = 1
+EXIT_USAGE = 2
+EXIT_LOCKED = 3
+EXIT_PRECONDITION = 4
+EXIT_WIDENING = 40
+EXIT_PINNED_REMOVED = 41
+EXIT_INVALID = 42
+EXIT_SELFTEST_FAILED = 43
+
+LOCK_TIMEOUT_S = 10
+DENIED_WINDOW_S = 300
+DENIED_MAX = 999_999  # Kuma field eg_deny: ^[0-9]{1,6}$
+DENIED_AUDIT_INTERVAL_S = 900
+MAX_ICS_HOSTS = 50
+MAX_ENTRIES_PER_ROLE = 200
+
+HOST_RE = re.compile(r"^(\*\.)?([a-z0-9]([a-z0-9-]{0,61}[a-z0-9])?\.)+[a-z]{2,63}$")
+ALLOWED_PORTS = (80, 443)
+PORT80_ROLES = ("host",)  # plain HTTP only for signed APT repositories
+ACTOR_KINDS = ("office-admin", "vendor", "system", "bootstrap")
+SEMVER_RE = re.compile(r"^[0-9]+\.[0-9]+\.[0-9]+(-[0-9A-Za-z.-]+)?$")
+
+# Suffixes where any customer can own a subdomain. A wildcard directly on one
+# of them would let a compromised client reach an attacker's bucket/worker.
+# Smokescreen v0.1.0 does not consult the Public Suffix List, so the check is
+# here; a wildcard additionally needs at least three labels after "*.".
+MULTI_TENANT_SUFFIXES = frozenset({
+    "akamaized.net", "amazonaws.com", "appspot.com", "azureedge.net", "azurewebsites.net",
+    "blob.core.windows.net", "blogspot.com", "cloudflarestorage.com", "cloudfront.net",
+    "cloudfunctions.net", "core.windows.net", "deno.dev", "digitaloceanspaces.com",
+    "elasticbeanstalk.com", "fastly.net", "firebaseapp.com", "fly.dev", "github.io",
+    "githubusercontent.com", "gitlab.io", "global.ssl.fastly.net", "googleapis.com",
+    "herokuapp.com", "netlify.app", "ngrok-free.app", "ngrok.io", "onrender.com", "pages.dev",
+    "r2.cloudflarestorage.com", "r2.dev", "run.app", "s3.amazonaws.com", "storage.googleapis.com",
+    "supabase.co", "supabase.in", "trycloudflare.com", "vercel.app", "web.app", "wordpress.com",
+    "workers.dev",
+})
+
+ICS_PURPOSE = "office calendar (ICS) source"
+
+# Used only by validate-data, which runs on the release machine without
+# config.json; on the server the values come from config.json.
+CONTRACT_ROLES = ("host", "app", "auth", "functions", "intake", "publish")  # contract: legatto_egress_roles
+CONTRACT_FEATURES = ("ai", "mcp", "email", "getresponse", "push", "ics", "hibp")  # contract: legatto_feature_names
+
+
+class EgressError(Exception):
+    """Error with an exit code from CONTRACT §4.6."""
+
+    def __init__(self, message: str, code: int = EXIT_ERROR):
+        super().__init__(message)
+        self.code = code
+
+
+def invalid(message: str) -> EgressError:
+    return EgressError(message, EXIT_INVALID)
+
+
+def precondition(message: str) -> EgressError:
+    return EgressError(message, EXIT_PRECONDITION)
+
+
+def utc_now() -> str:
+    return dt.datetime.now(dt.timezone.utc).strftime("%Y-%m-%dT%H:%M:%SZ")
+
+
+def log(message: str) -> None:
+    print(f"legatto-egress: {message}", file=sys.stderr)
+
+
+def canonical(obj: Any) -> bytes:
+    return (json.dumps(obj, sort_keys=True, indent=2, ensure_ascii=False) + "\n").encode("utf-8")
+
+
+def read_json(path: Path, what: str) -> Any:
+    try:
+        with path.open("rb") as fh:
+            return json.load(fh)
+    except FileNotFoundError:
+        raise
+    except (OSError, ValueError) as exc:
+        raise invalid(f"{what} {path}: cannot read JSON: {exc}") from exc
+
+
+def write_atomic(path: Path, data: bytes, mode: int = 0o644, gid: int | None = None) -> None:
+    path.parent.mkdir(parents=True, exist_ok=True)
+    fd, tmp = tempfile.mkstemp(prefix=f".{path.name}.", dir=str(path.parent))
+    try:
+        with os.fdopen(fd, "wb") as fh:
+            fh.write(data)
+            fh.flush()
+            os.fsync(fh.fileno())
+        os.chmod(tmp, mode)
+        if gid is not None:
+            os.chown(tmp, 0, gid)
+        os.replace(tmp, path)
+        dfd = os.open(str(path.parent), os.O_RDONLY)
+        try:
+            os.fsync(dfd)
+        finally:
+            os.close(dfd)
+    except BaseException:
+        with contextlib.suppress(FileNotFoundError):
+            os.unlink(tmp)
+        raise
+
+
+def sha256_bytes(data: bytes) -> str:
+    return hashlib.sha256(data).hexdigest()
+
+
+def fill(template_name: str, values: dict[str, str]) -> str:
+    text = (TEMPLATE_DIR / template_name).read_text(encoding="utf-8")
+    for key, value in values.items():
+        text = text.replace(f"@@{key}@@", value)
+    left = re.findall(r"@@[A-Z0-9_]+@@", text)
+    if left:
+        raise EgressError(f"template {template_name}: unresolved placeholders {sorted(set(left))}")
+    return text
+
+
+# --------------------------------------------------------------------------- config
+
+
+class Config:
+    """Contract values rendered by the Ansible role into config.json."""
+
+    def __init__(self, path: Path):
+        try:
+            raw = read_json(path, "config")
+        except FileNotFoundError as exc:
+            raise precondition(f"missing {path} (installed by the Ansible role egress)") from exc
+        if not isinstance(raw, dict) or raw.get("v") != 1:
+            raise precondition(f"{path}: unsupported config version")
+        self.path = path
+        self.raw = raw
+        try:
+            self.mode: str = raw["mode"]
+            self.modes: list[str] = list(raw["modes"])
+            self.roles: list[str] = list(raw["roles"])
+            self.feature_names: list[str] = list(raw["feature_names"])
+            self.feature_defaults: dict[str, bool] = dict(raw["feature_defaults"])
+            self.ics_role: str = raw["ics_role"]
+            self.office_entries: list[dict] = list(raw["office_entries"])
+            self.paths: dict[str, str] = dict(raw["paths"])
+            self.status_group: str = raw["status_group"]
+            self.host_proxy: dict = dict(raw["host_proxy"])
+            self.container_proxies: dict[str, dict] = dict(raw["container_proxies"])
+            self.container: dict = dict(raw["container"])
+            self.compose_project: str = raw["compose_project"]
+            self.nft: dict = dict(raw["nft"])
+            self.dns_blackhole: str = raw["dns_blackhole"]
+            self.dot_resolvers: list[str] = list(raw["dot_resolvers"])
+            self.system_users: dict[str, str] = dict(raw["system_users"])
+            self.nodns_units: list[str] = list(raw["nodns_units"])
+            self.docker: dict = dict(raw["docker"])
+        except (KeyError, TypeError, ValueError) as exc:
+            raise precondition(f"{path}: incomplete config: {exc}") from exc
+        if self.mode not in self.modes:
+            raise precondition(f"{path}: mode {self.mode!r} not in {self.modes}")
+        if set(self.container_proxies) | {"host"} != set(self.roles):
+            raise precondition(f"{path}: container_proxies + host must equal roles")
+        for entry in self.office_entries:
+            validate_entry(self, entry, "config office_entries")
+
+    def p(self, key: str) -> Path:
+        try:
+            return Path(self.paths[key])
+        except KeyError as exc:
+            raise precondition(f"{self.path}: paths.{key} missing") from exc
+
+    @property
+    def container_roles(self) -> list[str]:
+        return [r for r in self.roles if r != "host"]
+
+
+# --------------------------------------------------------------------------- validation
+
+
+def host_problem(host: Any, allow_wildcard: bool = True) -> str | None:
+    if not isinstance(host, str) or not host:
+        return "host must be a non-empty string"
+    bare = host[2:] if host.startswith("*.") else host
+    with contextlib.suppress(ValueError):
+        ipaddress.ip_address(bare.strip("[]"))
+        return f"{host}: IP literals are not allowed, use a host name"
+    if re.fullmatch(r"[0-9.]+", bare) or ":" in host or "/" in host:
+        return f"{host}: IP literals, ports and paths are not allowed"
+    if len(host) > 253 or not HOST_RE.match(host):
+        return f"{host}: not an exact lowercase host name (optionally with one leading '*.')"
+    if host.startswith("*."):
+        if not allow_wildcard:
+            return f"{host}: wildcards are not allowed here"
+        if bare.count(".") < 2:
+            return f"{host}: wildcard base must have at least three labels"
+        if bare in MULTI_TENANT_SUFFIXES:
+            return f"{host}: wildcard directly on a multi-tenant suffix"
+    return None
+
+
+def validate_entry(cfg: Config | None, entry: Any, where: str, role: str | None = None) -> dict:
+    if not isinstance(entry, dict):
+        raise invalid(f"{where}: entry must be an object")
+    expected = {"host", "port", "purpose"} | ({"role"} if role is None else set())
+    if set(entry) != expected:
+        raise invalid(f"{where}: entry keys must be {sorted(expected)}, got {sorted(entry)}")
+    r = entry["role"] if role is None else role
+    roles = cfg.roles if cfg else list(CONTRACT_ROLES)
+    if r not in roles:
+        raise invalid(f"{where}: unknown role {r!r}")
+    problem = host_problem(entry["host"])
+    if problem:
+        raise invalid(f"{where}: {problem}")
+    port = entry["port"]
+    if isinstance(port, bool) or port not in ALLOWED_PORTS:
+        raise invalid(f"{where}: {entry['host']}: port must be one of {list(ALLOWED_PORTS)}")
+    if port == 80 and r not in PORT80_ROLES:
+        raise invalid(f"{where}: {entry['host']}: port 80 is allowed only for role host (APT)")
+    purpose = entry["purpose"]
+    if not isinstance(purpose, str) or not 1 <= len(purpose) <= 200:
+        raise invalid(f"{where}: {entry['host']}: purpose must have 1-200 characters")
+    return {"role": r, "host": entry["host"], "port": port, "purpose": purpose}
+
+
+def validate_role_map(cfg: Config | None, data: Any, where: str) -> dict[str, list[dict]]:
+    if not isinstance(data, dict):
+        raise invalid(f"{where}: must be an object of role -> entries")
+    out: dict[str, list[dict]] = {}
+    roles = cfg.roles if cfg else list(CONTRACT_ROLES)
+    for role, entries in data.items():
+        if role not in roles:
+            raise invalid(f"{where}: unknown role {role!r}")
+        if not isinstance(entries, list):
+            raise invalid(f"{where}.{role}: must be a list")
+        if len(entries) > MAX_ENTRIES_PER_ROLE:
+            raise invalid(f"{where}.{role}: more than {MAX_ENTRIES_PER_ROLE} entries")
+        seen: set[tuple[str, int]] = set()
+        checked = []
+        for i, e in enumerate(entries):
+            v = validate_entry(cfg, e, f"{where}.{role}[{i}]", role=role)
+            key = (v["host"], v["port"])
+            if key in seen:
+                raise invalid(f"{where}.{role}: duplicate {v['host']}:{v['port']}")
+            seen.add(key)
+            checked.append({"host": v["host"], "port": v["port"], "purpose": v["purpose"]})
+        out[role] = checked
+    return out
+
+
+def validate_egress(cfg: Config | None, egress: Any, where: str = "egress") -> dict:
+    """Validate a manifest.egress object; returns {"roles": …, "features": …}."""
+    if not isinstance(egress, dict):
+        raise invalid(f"{where}: must be an object")
+    if set(egress) != {"version", "roles", "features"}:
+        raise invalid(f"{where}: keys must be version, roles, features")
+    if egress["version"] != 1 or isinstance(egress["version"], bool):
+        raise invalid(f"{where}.version: must be 1")
+    roles = validate_role_map(cfg, egress["roles"], f"{where}.roles")
+    feats = egress["features"]
+    if not isinstance(feats, dict):
+        raise invalid(f"{where}.features: must be an object")
+    names = cfg.feature_names if cfg else list(CONTRACT_FEATURES)
+    features: dict[str, dict[str, list[dict]]] = {}
+    for name, role_map in feats.items():
+        if name not in names:
+            raise invalid(f"{where}.features: unknown feature {name!r}")
+        features[name] = validate_role_map(cfg, role_map, f"{where}.features.{name}")
+    return {"roles": roles, "features": features}
+
+
+EMPTY_EGRESS: dict = {"roles": {}, "features": {}}
+
+
+def load_release(cfg: Config, release_dir: str | None) -> tuple[str | None, dict]:
+    """(version, validated egress) of a release directory; `none` or a missing dir = empty."""
+    if release_dir is None or release_dir == "none":
+        return None, EMPTY_EGRESS
+    d = Path(release_dir)
+    if not d.exists():
+        return None, EMPTY_EGRESS
+    manifest_path = d / "manifest.json"
+    try:
+        manifest = read_json(manifest_path, "manifest")
+    except FileNotFoundError as exc:
+        raise invalid(f"{manifest_path}: missing") from exc
+    if not isinstance(manifest, dict) or "egress" not in manifest:
+        raise invalid(f"{manifest_path}: no egress section")
+    version = manifest.get("version")
+    if not isinstance(version, str) or not SEMVER_RE.match(version):
+        raise invalid(f"{manifest_path}: bad version")
+    return version, validate_egress(cfg, manifest["egress"], f"{manifest_path}:egress")
+
+
+def load_features(cfg: Config) -> tuple[dict[str, bool], list[str]]:
+    path = cfg.p("features")
+    try:
+        raw = read_json(path, "features")
+    except FileNotFoundError:
+        return dict(cfg.feature_defaults), []
+    if not isinstance(raw, dict) or raw.get("v") != 1:
+        raise invalid(f"{path}: expected {{\"v\":1,…}}")
+    flags = raw.get("features")
+    if not isinstance(flags, dict):
+        raise invalid(f"{path}: features must be an object")
+    out = dict(cfg.feature_defaults)
+    for name, value in flags.items():
+        if name not in cfg.feature_names:
+            raise invalid(f"{path}: unknown feature {name!r}")
+        if not isinstance(value, bool):
+            raise invalid(f"{path}: features.{name} must be true or false")
+        out[name] = value
+    ics = raw.get("ics_hosts", [])
+    if not isinstance(ics, list) or len(ics) > MAX_ICS_HOSTS:
+        raise invalid(f"{path}: ics_hosts must be a list of at most {MAX_ICS_HOSTS} host names")
+    hosts: list[str] = []
+    for h in ics:
+        problem = host_problem(h, allow_wildcard=False)
+        if problem:
+            raise invalid(f"{path}: ics_hosts: {problem}")
+        if h not in hosts:
+            hosts.append(h)
+    return out, hosts
+
+
+def load_pinned(cfg: Config) -> list[dict]:
+    path = cfg.p("pinned")
+    try:
+        raw = read_json(path, "pinned")
+    except FileNotFoundError as exc:
+        raise precondition(f"missing {path} (written by the Ansible role egress)") from exc
+    if not isinstance(raw, dict) or raw.get("v") != 1 or not isinstance(raw.get("entries"), list):
+        raise invalid(f"{path}: expected {{\"v\":1,\"entries\":[…]}}")
+    return [validate_entry(cfg, e, f"{path}[{i}]") for i, e in enumerate(raw["entries"])]
+
+
+# --------------------------------------------------------------------------- allowlist
+
+
+def effective_entries(cfg: Config, egress: dict, flags: dict[str, bool], ics_hosts: list[str],
+                      pinned: list[dict]) -> list[dict]:
+    """Union of base, enabled features, ICS hosts, office entries and pinned entries."""
+    merged: dict[tuple[str, str, int], dict] = {}
+
+    def add(role: str, host: str, port: int, purpose: str, source: str) -> None:
+        key = (role, host, port)
+        item = merged.setdefault(key, {"role": role, "host": host, "port": port,
+                                       "purpose": purpose, "sources": []})
+        if source not in item["sources"]:
+            item["sources"].append(source)
+
+    for role, entries in egress["roles"].items():
+        for e in entries:
+            add(role, e["host"], e["port"], e["purpose"], "base")
+    for name in cfg.feature_names:
+        if not flags.get(name):
+            continue
+        for role, entries in egress["features"].get(name, {}).items():
+            for e in entries:
+                add(role, e["host"], e["port"], e["purpose"], f"feature:{name}")
+        if name == "ics":
+            for h in ics_hosts:
+                add(cfg.ics_role, h, 443, ICS_PURPOSE, "feature:ics")
+    for e in cfg.office_entries:
+        add(e["role"], e["host"], e["port"], e["purpose"], "office")
+    for e in pinned:
+        add(e["role"], e["host"], e["port"], e["purpose"], "pinned")
+    return sorted(merged.values(), key=lambda x: (cfg.roles.index(x["role"]), x["host"], x["port"]))
+
+
+def by_role(cfg: Config, entries: list[dict]) -> dict[str, list[dict]]:
+    out: dict[str, list[dict]] = {r: [] for r in cfg.roles}
+    for e in entries:
+        out[e["role"]].append(e)
+    return out
+
+
+# --------------------------------------------------------------------------- render
+
+
+def uid_of(name: str) -> int | None:
+    try:
+        return pwd.getpwnam(name).pw_uid
+    except KeyError:
+        return None
+
+
+def acl_text(role: str, mode: str, release: str | None, hosts: list[str]) -> str:
+    domains = "".join(f"\n    - {json.dumps(h)}" for h in hosts) if hosts else " []"
+    return fill("smokescreen-acl.yaml.in", {
+        "GENERATOR": GENERATOR, "ROLE": role, "RELEASE": release or "none", "MODE": mode,
+        "ACTION": "enforce" if mode == "enforce" else "report", "ALLOWED_DOMAINS": domains,
+    })
+
+
+def proxy_config_text(cfg: Config, role: str) -> str:
+    if role == "host":
+        listen_ip = cfg.host_proxy["listen"]
+        port = cfg.host_proxy["port"]
+        acl_file = str(cfg.p("proxy_dir") / "host" / "acl.yaml")
+        resolver = "# Host instance: system resolver (systemd-resolved, DNS over TLS)."
+    else:
+        listen_ip = cfg.container["listen"]
+        port = cfg.container["port"]
+        acl_file = cfg.container["acl_path"]
+        resolver = f"resolver_addresses: [{json.dumps(cfg.container['resolver'])}]"
+    return fill("smokescreen.yaml.in", {
+        "GENERATOR": GENERATOR, "ROLE": role, "LISTEN_IP": listen_ip, "LISTEN_PORT": str(int(port)),
+        "ACL_FILE": acl_file, "RESOLVER": resolver,
+    })
+
+
+def nft_set(items: Iterable[str]) -> str:
+    return ", ".join(items)
+
+
+def nft_text(cfg: Config, release: str | None, roles: dict[str, list[dict]]) -> tuple[str, list[str]]:
+    """Render egress.nft; returns (text, warnings)."""
+    warnings: list[str] = []
+    mode = cfg.mode
+    verdict = "drop" if mode == "enforce" else "accept"
+    prefix = "legatto-egress-deny" if mode == "enforce" else "legatto-egress-observe"
+
+    client_uids: list[str] = []
+    for name in cfg.host_proxy["clients"]:
+        uid = uid_of(name)
+        if uid is None:
+            warnings.append(f"host proxy client {name!r} does not exist; skipped")
+        else:
+            client_uids.append(str(uid))
+    if not client_uids:
+        raise invalid("no host proxy client user exists")
+
+    host_rules: list[str] = []
+    proxy_uid = uid_of(cfg.host_proxy["user"])
+    host_ports = sorted({e["port"] for e in roles["host"]})
+    if proxy_uid is None:
+        raise precondition(f"user {cfg.host_proxy['user']!r} does not exist (role egress creates it)")
+    if host_ports:
+        host_rules.append("\t\t# Host proxy uplink: ports of the host role entries.")
+        host_rules.append(f"\t\tmeta skuid {proxy_uid} tcp dport {{ {nft_set(map(str, host_ports))} }} accept")
+    resolver_uid = uid_of(cfg.system_users["resolver"])
+    dot4 = [a for a in cfg.dot_resolvers if ipaddress.ip_address(a).version == 4]
+    dot6 = [a for a in cfg.dot_resolvers if ipaddress.ip_address(a).version == 6]
+    if resolver_uid is None:
+        warnings.append(f"resolver user {cfg.system_users['resolver']!r} does not exist; DNS rules skipped")
+    else:
+        host_rules.append("\t\t# systemd-resolved: DNS over TLS to the configured resolvers only.")
+        for fam, addrs in (("ip", dot4), ("ip6", dot6)):
+            if addrs:
+                host_rules.append(f"\t\tmeta skuid {resolver_uid} {fam} daddr {{ {nft_set(addrs)} }} "
+                                  "tcp dport { 53, 853 } accept")
+                host_rules.append(f"\t\tmeta skuid {resolver_uid} {fam} daddr {{ {nft_set(addrs)} }} "
+                                  "udp dport 53 accept")
+    ntp_uid = uid_of(cfg.system_users["ntp"])
+    if ntp_uid is None:
+        warnings.append(f"NTP user {cfg.system_users['ntp']!r} does not exist; NTP rules skipped")
+    else:
+        host_rules.append("\t\t# chrony: NTP and NTS key establishment.")
+        host_rules.append(f"\t\tmeta skuid {ntp_uid} udp dport 123 accept")
+        host_rules.append(f"\t\tmeta skuid {ntp_uid} tcp dport 4460 accept")
+    wg_uid = uid_of(cfg.system_users["wireguard"])
+    if wg_uid is None:
+        warnings.append(f"WireGuard user {cfg.system_users['wireguard']!r} does not exist; rule skipped")
+    else:
+        host_rules.append("\t\t# tailscaled: direct WireGuard paths to tailnet peers.")
+        host_rules.append(f"\t\tmeta skuid {wg_uid} udp sport {int(cfg.nft['wireguard_port'])} accept")
+    host_rules.extend([
+        "\t\t# DHCPv4/DHCPv6 lease renewal and IPv6 neighbour discovery.",
+        "\t\tudp sport 68 udp dport 67 accept",
+        "\t\tudp sport 546 udp dport 547 accept",
+        "\t\ticmpv6 type { nd-router-solicit, nd-neighbor-solicit, nd-neighbor-advert, "
+        "mld2-listener-report } accept",
+    ])
+
+    fwd_rules: list[str] = []
+    ext_if = cfg.nft["egress_ext_bridge"]
+    resolver_ip, _, resolver_port = cfg.container["resolver"].rpartition(":")
+    active_ips: list[str] = []
+    for role in cfg.container_roles:
+        ports = sorted({e["port"] for e in roles[role]})
+        proxy = cfg.container_proxies[role]
+        if not ports:
+            fwd_rules.append(f"\t\t# {proxy['service']} ({role}): empty allowlist, no uplink.")
+            continue
+        active_ips.append(proxy["ext_ip"])
+        fwd_rules.append(f"\t\t# {proxy['service']} ({role}).")
+        fwd_rules.append(f"\t\tiifname \"{ext_if}\" ip saddr {proxy['ext_ip']} "
+                         f"tcp dport {{ {nft_set(map(str, ports))} }} accept")
+    if active_ips:
+        fwd_rules.append("\t\t# Name resolution of the active proxies.")
+        for proto in ("udp", "tcp"):
+            fwd_rules.append(f"\t\tiifname \"{ext_if}\" ip saddr {{ {nft_set(active_ips)} }} "
+                             f"ip daddr {resolver_ip} {proto} dport {int(resolver_port)} accept")
+
+    local_ifaces = [cfg.nft["tailscale_if"], *cfg.nft["docker_bridges"]]
+    text = fill("egress.nft.in", {
+        "GENERATOR": GENERATOR, "RELEASE": release or "none", "MODE": mode,
+        "HOST_PROXY_IP": cfg.host_proxy["listen"], "HOST_PROXY_PORT": str(int(cfg.host_proxy["port"])),
+        "HOST_PROXY_CLIENT_UIDS": nft_set(client_uids), "LOG_PREFIX": prefix, "DENY_VERDICT": verdict,
+        "LOCAL_IFACES": nft_set(f'"{i}"' for i in local_ifaces),
+        "HOST_SERVICE_RULES": "\n".join(host_rules), "PROXY_FWD_RULES": "\n".join(fwd_rules),
+        "METADATA_IP": cfg.nft["metadata_ip"],
+    })
+    return text, warnings
+
+
+def render(cfg: Config, release_dir: str | None, out: Path) -> dict:
+    release, egress = load_release(cfg, release_dir)
+    flags, ics_hosts = load_features(cfg)
+    pinned = load_pinned(cfg)
+    entries = effective_entries(cfg, egress, flags, ics_hosts, pinned)
+    roles = by_role(cfg, entries)
+    nft, warnings = nft_text(cfg, release, roles)
+
+    allowlist = {
+        "v": 1,
+        "generator": GENERATOR,
+        "release": release,
+        "mode": cfg.mode,
+        "features_active": [f for f in cfg.feature_names if flags.get(f)],
+        "roles_active": [r for r in cfg.roles if roles[r]],
+        "entries": entries,
+        "egress": egress,
+    }
+    files: dict[str, bytes] = {
+        "allowlist.json": canonical(allowlist),
+        "features.json": canonical({"v": 1, "features": flags, "ics_hosts": ics_hosts}),
+        "pinned.json": canonical({"v": 1, "entries": pinned}),
+        "egress.nft": nft.encode("utf-8"),
+    }
+    for role in cfg.roles:
+        hosts = sorted({e["host"] for e in roles[role]})
+        files[f"proxy/{role}/acl.yaml"] = acl_text(role, cfg.mode, release, hosts).encode("utf-8")
+        files[f"proxy/{role}/smokescreen.yaml"] = proxy_config_text(cfg, role).encode("utf-8")
+
+    out.mkdir(parents=True, exist_ok=True)
+    for rel, data in files.items():
+        write_atomic(out / rel, data, 0o644)
+    for w in warnings:
+        log(f"warning: {w}")
+    return {"release": release, "mode": cfg.mode, "out": str(out), "files": sorted(files),
+            "roles_active": allowlist["roles_active"], "features_active": allowlist["features_active"],
+            "entries": len(entries), "warnings": warnings}
+
+
+# --------------------------------------------------------------------------- check
+
+
+def nft_check(cfg: Config, nft_file: Path) -> None:
+    if shutil.which("nft") is None:
+        raise precondition("nft not found")
+    fam, table = cfg.nft["family"], cfg.nft["table"]
+    out_chain, fwd_chain = cfg.nft["chain_out"], cfg.nft["chain_fwd"]
+    script = (
+        f"table {fam} {table} {{\n\tchain {out_chain} {{\n\t}}\n\tchain {fwd_chain} {{\n\t}}\n}}\n"
+        f"flush chain {fam} {table} {out_chain}\nflush chain {fam} {table} {fwd_chain}\n"
+        f"include \"{nft_file}\"\n"
+    )
+    with tempfile.NamedTemporaryFile("w", suffix=".nft", delete=False) as fh:
+        fh.write(script)
+        tmp = fh.name
+    try:
+        res = subprocess.run(["nft", "-c", "-f", tmp], capture_output=True, text=True, check=False)
+    finally:
+        os.unlink(tmp)
+    if res.returncode != 0:
+        raise invalid(f"nft -c rejected {nft_file}: {res.stderr.strip()}")
+
+
+def check(cfg: Config, d: Path) -> dict:
+    """Validate a rendered directory: data, ACL syntax, consistency, nft -c."""
+    try:
+        allow = read_json(d / "allowlist.json", "allowlist")
+    except FileNotFoundError as exc:
+        raise invalid(f"{d}: allowlist.json missing (run render first)") from exc
+    if not isinstance(allow, dict) or allow.get("v") != 1:
+        raise invalid(f"{d}/allowlist.json: unsupported version")
+    if allow.get("mode") != cfg.mode:
+        raise invalid(f"{d}: rendered for mode {allow.get('mode')!r}, config says {cfg.mode!r}")
+    validate_egress(cfg, {"version": 1, **allow["egress"]}, f"{d}/allowlist.json:egress")
+    entries = allow.get("entries")
+    if not isinstance(entries, list):
+        raise invalid(f"{d}/allowlist.json: entries missing")
+    for i, e in enumerate(entries):
+        validate_entry(cfg, {k: e.get(k) for k in ("role", "host", "port", "purpose")},
+                       f"{d}/allowlist.json entries[{i}]")
+    roles = by_role(cfg, entries)
+    release = allow.get("release")
+    for role in cfg.roles:
+        hosts = sorted({e["host"] for e in roles[role]})
+        expect = {
+            f"proxy/{role}/acl.yaml": acl_text(role, cfg.mode, release, hosts),
+            f"proxy/{role}/smokescreen.yaml": proxy_config_text(cfg, role),
+        }
+        for rel, text in expect.items():
+            try:
+                actual = (d / rel).read_text(encoding="utf-8")
+            except FileNotFoundError as exc:
+                raise invalid(f"{d}/{rel}: missing") from exc
+            if actual != text:
+                raise invalid(f"{d}/{rel}: does not match allowlist.json")
+            if rel.endswith("acl.yaml"):
+                validate_acl_syntax(d / rel)
+    nft_expect, _ = nft_text(cfg, release, roles)
+    nft_path = d / "egress.nft"
+    if not nft_path.is_file() or nft_path.read_text(encoding="utf-8") != nft_expect:
+        raise invalid(f"{nft_path}: missing or does not match allowlist.json")
+    nft_check(cfg, nft_path)
+    return {"dir": str(d), "ok": True, "roles_active": allow.get("roles_active", [])}
+
+
+def validate_acl_syntax(path: Path) -> None:
+    """Re-check the generated ACL against Smokescreen v0.1.0 glob rules."""
+    lines = path.read_text(encoding="utf-8").splitlines()
+    if "version: v1" not in lines or "services: []" not in lines:
+        raise invalid(f"{path}: not a Smokescreen v1 ACL")
+    action = [ln.split(":", 1)[1].strip() for ln in lines if ln.startswith("  action:")]
+    if action not in (["enforce"], ["report"]):
+        raise invalid(f"{path}: action must be enforce or report")
+    for ln in lines:
+        if ln.startswith("    - "):
+            glob = json.loads(ln[6:])
+            if glob in ("*", "*.") or ("*" in glob and not glob.startswith("*.")) or "*" in glob[2:]:
+                raise invalid(f"{path}: invalid glob {glob!r}")
+            problem = host_problem(glob)
+            if problem:
+                raise invalid(f"{path}: {problem}")
+
+
+# --------------------------------------------------------------------------- diff
+
+
+def triples(egress: dict) -> dict[tuple[str, str, str, int], dict]:
+    out: dict[tuple[str, str, str, int], dict] = {}
+    for role, entries in egress["roles"].items():
+        for e in entries:
+            out[("base", role, e["host"], e["port"])] = e
+    for name, role_map in egress["features"].items():
+        for role, entries in role_map.items():
+            for e in entries:
+                out[(f"feature:{name}", role, e["host"], e["port"])] = e
+    return out
+
+
+def diff(cfg: Config, from_dir: str, to_dir: str) -> tuple[dict, int]:
+    _, old = load_release(cfg, from_dir)
+    new_version, new = load_release(cfg, to_dir)
+    flags, _ = load_features(cfg)
+    pinned = load_pinned(cfg)
+    old_t, new_t = triples(old), triples(new)
+    old_base = {(r, h, p) for (s, r, h, p) in old_t if s == "base"}
+
+    def active(scope: str) -> bool:
+        return scope == "base" or bool(flags.get(scope.split(":", 1)[1]))
+
+    def row(key: tuple[str, str, str, int]) -> dict:
+        scope, role, host, port = key
+        return {"role": role, "host": host, "port": port, "source": scope, "active": active(scope)}
+
+    added, widening_rows = [], []
+    for key in sorted(set(new_t) - set(old_t)):
+        scope, role, host, port = key
+        added.append(row(key))
+        # An entry added to a feature is covered when the same (role, host,
+        # port) was already always-on; everything else is a widening.
+        covered = scope != "base" and (role, host, port) in old_base
+        if not covered:
+            widening_rows.append(row(key))
+    removed = [row(k) for k in sorted(set(old_t) - set(new_t))]
+    new_base = {(r, h, p) for (s, r, h, p) in new_t if s == "base"}
+    pinned_removed = [
+        {"role": e["role"], "host": e["host"], "port": e["port"], "purpose": e["purpose"]}
+        for e in pinned
+        if (e["role"], e["host"], e["port"]) in old_base and (e["role"], e["host"], e["port"]) not in new_base
+    ]
+    result = {
+        "widening": bool(widening_rows),
+        "added": added,
+        "removed": removed,
+        "widening_entries": widening_rows,
+        "pinned_removed": pinned_removed,
+        "to_release": new_version,
+    }
+    if pinned_removed:
+        return result, EXIT_PINNED_REMOVED
+    if widening_rows:
+        return result, EXIT_WIDENING
+    return result, EXIT_OK
+
+
+# --------------------------------------------------------------------------- apply
+
+
+@contextlib.contextmanager
+def locked(cfg: Config):
+    path = cfg.p("lock")
+    path.parent.mkdir(parents=True, exist_ok=True)
+    fd = os.open(str(path), os.O_RDWR | os.O_CREAT, 0o600)
+    try:
+        deadline = time.monotonic() + LOCK_TIMEOUT_S
+        while True:
+            try:
+                fcntl.flock(fd, fcntl.LOCK_EX | fcntl.LOCK_NB)
+                break
+            except OSError as exc:
+                if exc.errno not in (errno.EAGAIN, errno.EACCES) or time.monotonic() > deadline:
+                    raise EgressError("another legatto-egress holds the lock", EXIT_LOCKED) from exc
+                time.sleep(0.2)
+        yield
+    finally:
+        os.close(fd)
+
+
+def require_root() -> None:
+    if os.geteuid() != 0:
+        raise precondition("must run as root")
+
+
+def parse_actor(raw: str | None) -> dict:
+    if raw is None:
+        return {"kind": "system", "id": "legatto-egress"}
+    try:
+        actor = json.loads(raw)
+    except ValueError as exc:
+        raise EgressError(f"--actor: not JSON: {exc}", EXIT_USAGE) from exc
+    if not isinstance(actor, dict) or actor.get("kind") not in ACTOR_KINDS:
+        raise EgressError(f"--actor: object with kind in {list(ACTOR_KINDS)} required", EXIT_USAGE)
+    return actor
+
+
+def audit(cfg: Config, event: str, actor: dict, params: dict) -> None:
+    cli = cfg.p("audit_cli")
+    res = subprocess.run(
+        [str(cli), "append", "--cat", "egress", "--event", event, "--actor",
+         json.dumps(actor, separators=(",", ":")), "--params", json.dumps(params, separators=(",", ":"))],
+        capture_output=True, text=True, check=False)
+    if res.returncode != 0:
+        raise EgressError(f"legatto-audit append {event} failed ({res.returncode}): {res.stderr.strip()}")
+
+
+def nft_load(cfg: Config) -> None:
+    fam, table = cfg.nft["family"], cfg.nft["table"]
+    script = (f"flush chain {fam} {table} {cfg.nft['chain_out']}\n"
+              f"flush chain {fam} {table} {cfg.nft['chain_fwd']}\n"
+              f"include \"{cfg.p('nft_file')}\"\n")
+    with tempfile.NamedTemporaryFile("w", suffix=".nft", delete=False) as fh:
+        fh.write(script)
+        tmp = fh.name
+    try:
+        res = subprocess.run(["nft", "-f", tmp], capture_output=True, text=True, check=False)
+    finally:
+        os.unlink(tmp)
+    if res.returncode != 0:
+        raise EgressError(f"nft -f failed: {res.stderr.strip()}")
+
+
+def nft_table_present(cfg: Config) -> bool:
+    res = subprocess.run(["nft", "list", "chain", cfg.nft["family"], cfg.nft["table"], cfg.nft["chain_out"]],
+                         capture_output=True, text=True, check=False)
+    return res.returncode == 0
+
+
+def unit_loaded(unit: str) -> bool:
+    if shutil.which("systemctl") is None:
+        return False
+    res = subprocess.run(["systemctl", "show", "-p", "LoadState", "--value", unit],
+                         capture_output=True, text=True, check=False)
+    return res.returncode == 0 and res.stdout.strip() == "loaded"
+
+
+def docker_available() -> bool:
+    if shutil.which("docker") is None:
+        return False
+    return subprocess.run(["docker", "info", "--format", "{{.ID}}"], capture_output=True,
+                          check=False).returncode == 0
+
+
+def proxy_containers(cfg: Config, role: str, all_states: bool = True) -> list[str]:
+    service = cfg.container_proxies[role]["service"]
+    cmd = ["docker", "ps", "-q", "--no-trunc",
+           "--filter", f"label=com.docker.compose.project={cfg.compose_project}",
+           "--filter", f"label=com.docker.compose.service={service}"]
+    if all_states:
+        cmd.insert(2, "-a")
+    res = subprocess.run(cmd, capture_output=True, text=True, check=False)
+    return res.stdout.split() if res.returncode == 0 else []
+
+
+def install_files(cfg: Config, src: Path) -> tuple[dict[str, bytes | None], list[str]]:
+    """Copy rendered files to their targets; returns (backup, changed proxy roles)."""
+    targets: dict[str, Path] = {"egress.nft": cfg.p("nft_file")}
+    for role in cfg.roles:
+        for name in ("acl.yaml", "smokescreen.yaml"):
+            targets[f"proxy/{role}/{name}"] = cfg.p("proxy_dir") / role / name
+    backup: dict[str, bytes | None] = {}
+    changed_roles: list[str] = []
+    for rel, dst in targets.items():
+        new = (src / rel).read_bytes()
+        old = dst.read_bytes() if dst.exists() else None
+        backup[str(dst)] = old
+        if old != new:
+            write_atomic(dst, new, 0o644)
+            if rel.startswith("proxy/"):
+                role = rel.split("/")[1]
+                if role not in changed_roles:
+                    changed_roles.append(role)
+    rendered = cfg.p("rendered_dir")
+    rendered.mkdir(mode=0o700, parents=True, exist_ok=True)
+    os.chmod(rendered, 0o700)
+    for name in ("allowlist.json", "features.json", "pinned.json", "egress.nft"):
+        write_atomic(rendered / name, (src / name).read_bytes(), 0o600)
+    return backup, changed_roles
+
+
+def restore_files(backup: dict[str, bytes | None]) -> None:
+    for path, data in backup.items():
+        p = Path(path)
+        if data is None:
+            with contextlib.suppress(FileNotFoundError):
+                p.unlink()
+        else:
+            write_atomic(p, data, 0o644)
+
+
+def restart_proxies(cfg: Config, roles: list[str]) -> list[str]:
+    notes: list[str] = []
+    if "host" in roles:
+        unit = cfg.host_proxy["unit"]
+        if unit_loaded(unit):
+            res = subprocess.run(["systemctl", "restart", unit], capture_output=True, text=True, check=False)
+            if res.returncode != 0:
+                raise EgressError(f"systemctl restart {unit} failed: {res.stderr.strip()}")
+        else:
+            notes.append(f"{unit} not installed; host proxy not restarted")
+    container_roles = [r for r in cfg.container_roles if r in roles]
+    if container_roles:
+        if not docker_available():
+            notes.append("docker not available; container proxies not restarted")
+            return notes
+        for role in container_roles:
+            ids = proxy_containers(cfg, role, all_states=False)
+            if not ids:
+                notes.append(f"{cfg.container_proxies[role]['service']} not running; picks up the ACL at start")
+                continue
+            res = subprocess.run(["docker", "restart", "-t", "5", *ids], capture_output=True, text=True,
+                                 check=False)
+            if res.returncode != 0:
+                raise EgressError(f"docker restart {cfg.container_proxies[role]['service']} failed: "
+                                  f"{res.stderr.strip()}")
+    return notes
+
+
+def apply(cfg: Config, release_dir: str | None, actor: dict) -> dict:
+    require_root()
+    if shutil.which("nft") is None:
+        raise precondition("nft not found")
+    if not os.access(cfg.p("audit_cli"), os.X_OK):
+        raise precondition(f"{cfg.p('audit_cli')} missing (net lane)")
+    with locked(cfg):
+        if not nft_table_present(cfg):
+            raise precondition(f"nft chain {cfg.nft['table']}/{cfg.nft['chain_out']} missing (firewall role)")
+        staging = Path(tempfile.mkdtemp(prefix=".staging-", dir=str(cfg.p("etc"))))
+        try:
+            rendered = render(cfg, release_dir, staging)
+            check(cfg, staging)
+            backup, changed = install_files(cfg, staging)
+            try:
+                nft_load(cfg)
+            except EgressError:
+                restore_files(backup)
+                with contextlib.suppress(EgressError):
+                    nft_load(cfg)
+                raise
+            notes = restart_proxies(cfg, changed)
+        finally:
+            shutil.rmtree(staging, ignore_errors=True)
+        now = utc_now()
+        state = {"v": 1, "release": rendered["release"], "mode": cfg.mode, "at": now, "ok": True,
+                 "roles_active": rendered["roles_active"], "features_active": rendered["features_active"]}
+        write_state(cfg, "applied.json", state)
+        audit(cfg, "egress.applied", actor, {
+            "release": rendered["release"], "mode": cfg.mode, "entries": rendered["entries"],
+            "roles_active": rendered["roles_active"], "features_active": rendered["features_active"],
+            "restarted": changed,
+        })
+        write_status(cfg, denied=None)
+    return {**rendered, "applied_at": now, "restarted": changed, "notes": notes}
+
+
+# --------------------------------------------------------------------------- status
+
+
+def read_state(cfg: Config, name: str) -> dict:
+    path = cfg.p("state_dir") / name
+    try:
+        data = json.loads(path.read_text(encoding="utf-8"))
+        return data if isinstance(data, dict) else {}
+    except (OSError, ValueError):
+        return {}
+
+
+def write_state(cfg: Config, name: str, data: dict) -> None:
+    d = cfg.p("state_dir")
+    d.mkdir(mode=0o700, parents=True, exist_ok=True)
+    write_atomic(d / name, canonical(data), 0o600)
+
+
+def nft_counters(cfg: Config) -> dict[str, int] | None:
+    if shutil.which("nft") is None:
+        return None
+    res = subprocess.run(["nft", "-j", "list", "counters", "table", cfg.nft["family"], cfg.nft["table"]],
+                         capture_output=True, text=True, check=False)
+    if res.returncode != 0:
+        return None
+    out: dict[str, int] = {}
+    with contextlib.suppress(ValueError, KeyError, TypeError):
+        for item in json.loads(res.stdout).get("nftables", []):
+            c = item.get("counter")
+            if c and str(c.get("name", "")).startswith("egress_denied_"):
+                out[c["name"]] = int(c["packets"])
+    return out
+
+
+def journal_denies(cfg: Config, since_epoch: int) -> dict[str, int]:
+    """Smokescreen decisions with enforce_would_deny=true, per role, since a time."""
+    if shutil.which("journalctl") is None:
+        return {}
+    matches = [f"_SYSTEMD_UNIT={cfg.host_proxy['unit']}"]
+    names: dict[str, str] = {}
+    if docker_available():
+        for role in cfg.container_roles:
+            for cid in proxy_containers(cfg, role):
+                res = subprocess.run(["docker", "inspect", "--format", "{{.Name}}", cid],
+                                     capture_output=True, text=True, check=False)
+                name = res.stdout.strip().lstrip("/")
+                if name:
+                    names[name] = role
+                    matches += ["+", f"CONTAINER_NAME={name}"]
+    res = subprocess.run(["journalctl", "--no-pager", "-o", "json", f"--since=@{since_epoch}", *matches],
+                         capture_output=True, text=True, check=False)
+    counts: dict[str, int] = {}
+    for line in res.stdout.splitlines():
+        try:
+            rec = json.loads(line)
+            msg = rec.get("MESSAGE")
+            if isinstance(msg, list):
+                msg = bytes(msg).decode("utf-8", "replace")
+            event = json.loads(msg)
+        except (ValueError, TypeError):
+            continue
+        if event.get("msg") != "CANONICAL-PROXY-DECISION" or event.get("enforce_would_deny") is not True:
+            continue
+        role = names.get(rec.get("CONTAINER_NAME", ""), "host")
+        counts[role] = counts.get(role, 0) + 1
+    return counts
+
+
+def counter_delta(current: dict[str, int], base: dict[str, int]) -> dict[str, int]:
+    """Per-counter growth; a counter below its baseline was reset (table reload)."""
+    out: dict[str, int] = {}
+    for name, value in current.items():
+        old = base.get(name, value)
+        out[name.replace("egress_denied_", "nft_")] = value - old if value >= old else value
+    return out
+
+
+def denied_counts(cfg: Config, now: int) -> tuple[int, dict[str, int], dict[str, int]]:
+    """(denied_5m, by source over 5 min, new since the previous run).
+
+    Sources: nft deny counters (host, forward, proxy port) and Smokescreen
+    decisions with enforce_would_deny=true (host and container proxies). In
+    observe mode these are would-be denials. Only numbers leave this function.
+    """
+    st = read_state(cfg, "counters.json")
+    samples = [s for s in st.get("samples", [])
+               if isinstance(s, dict) and now - int(s.get("ts", 0)) <= 3 * DENIED_WINDOW_S]
+    current = nft_counters(cfg) or {}
+    prev_run = samples[-1] if samples else None
+    old = [s for s in samples if now - s["ts"] >= DENIED_WINDOW_S]
+    baseline = old[-1] if old else (samples[0] if samples else {"counters": current})
+    window = counter_delta(current, baseline["counters"])
+    fresh = counter_delta(current, prev_run["counters"] if prev_run else current)
+    for role, n in journal_denies(cfg, now - DENIED_WINDOW_S).items():
+        window[f"proxy_{role}"] = n
+    since_prev = int(prev_run["ts"]) if prev_run else now - 60
+    for role, n in journal_denies(cfg, since_prev).items():
+        fresh[f"proxy_{role}"] = n
+    samples.append({"ts": now, "counters": current})
+    write_state(cfg, "counters.json", {"v": 1, "samples": samples})
+    window = {k: v for k, v in window.items() if v > 0}
+    fresh = {k: v for k, v in fresh.items() if v > 0}
+    return min(sum(window.values()), DENIED_MAX), window, fresh
+
+
+def host_proxy_state(cfg: Config) -> str:
+    if shutil.which("systemctl") is None:
+        return "unknown"
+    res = subprocess.run(["systemctl", "is-active", cfg.host_proxy["unit"]], capture_output=True, text=True,
+                         check=False)
+    return res.stdout.strip() or "unknown"
+
+
+def write_status(cfg: Config, denied: tuple[int, dict[str, int]] | None) -> dict:
+    applied = read_state(cfg, "applied.json")
+    previous = read_status(cfg)
+    if denied is None:
+        denied_5m = int(previous.get("denied_5m", 0)) if isinstance(previous.get("denied_5m"), int) else 0
+    else:
+        denied_5m = denied[0]
+    proxy = host_proxy_state(cfg)
+    nft_ok = shutil.which("nft") is not None and nft_table_present(cfg)
+    status = {
+        "v": 1, "component": "egress", "ts": utc_now(),
+        "ok": bool(applied.get("ok")) and applied.get("mode") == cfg.mode and proxy == "active" and nft_ok,
+        "mode": cfg.mode,
+        "release": applied.get("release"),
+        "denied_5m": denied_5m,
+        "last_apply_at": applied.get("at"),
+        "roles_active": applied.get("roles_active", []),
+        "features_active": applied.get("features_active", []),
+        "host_proxy": proxy,
+    }
+    try:
+        gid: int | None = grp.getgrnam(cfg.status_group).gr_gid
+    except KeyError:
+        gid = None
+        log(f"warning: group {cfg.status_group} missing; status file stays root-only")
+    write_atomic(cfg.p("status_dir") / "egress.json", canonical(status), 0o640, gid)
+    return status
+
+
+def read_status(cfg: Config) -> dict:
+    try:
+        data = json.loads((cfg.p("status_dir") / "egress.json").read_text(encoding="utf-8"))
+        return data if isinstance(data, dict) else {}
+    except (OSError, ValueError):
+        return {}
+
+
+def status(cfg: Config, write: bool) -> dict:
+    if not write:
+        current = read_status(cfg)
+        if not current:
+            raise precondition("no status yet (legatto-egress status --write runs from the timer)")
+        return current
+    require_root()
+    with locked(cfg):
+        now = int(time.time())
+        total, window, fresh = denied_counts(cfg, now)
+        result = write_status(cfg, (total, window))
+        # egress.denied goes to the audit log in aggregate (counts only, never
+        # host names), at most once per DENIED_AUDIT_INTERVAL_S.
+        st = read_state(cfg, "denied-audit.json")
+        pending = {k: int(v) for k, v in st.get("pending", {}).items() if isinstance(v, int)}
+        for k, v in fresh.items():
+            pending[k] = pending.get(k, 0) + v
+        last_audit = int(st.get("last_audit", 0))
+        if sum(pending.values()) > 0 and now - last_audit >= DENIED_AUDIT_INTERVAL_S:
+            since = dt.datetime.fromtimestamp(last_audit, dt.timezone.utc).strftime("%Y-%m-%dT%H:%M:%SZ") \
+                if last_audit else None
+            audit(cfg, "egress.denied", {"kind": "system", "id": "legatto-egress"},
+                  {"count": min(sum(pending.values()), DENIED_MAX), "by_source": pending,
+                   "since": since, "mode": cfg.mode})
+            pending, last_audit = {}, now
+        write_state(cfg, "denied-audit.json", {"v": 1, "pending": pending, "last_audit": last_audit})
+    return result
+
+
+# --------------------------------------------------------------------------- selftest
+
+
+def proxy_connect(host: str, port: int, target: str, timeout: float = 5.0) -> int | None:
+    """CONNECT through an HTTP proxy; returns the status code or None on socket failure."""
+    try:
+        with socket.create_connection((host, port), timeout=timeout) as s:
+            s.sendall(f"CONNECT {target} HTTP/1.1\r\nHost: {target}\r\n\r\n".encode())
+            data = s.recv(256).decode("latin-1", "replace")
+    except OSError:
+        return None
+    m = re.match(r"HTTP/1\.[01] (\d{3})", data)
+    return int(m.group(1)) if m else None
+
+
+def connect_as(uid: int, host: str, port: int, timeout: float = 3.0) -> bool:
+    code = ("import socket,sys\n"
+            f"s=socket.socket(socket.AF_INET, socket.SOCK_STREAM); s.settimeout({timeout})\n"
+            f"sys.exit(0 if s.connect_ex(({host!r},{port}))==0 else 1)\n")
+    res = subprocess.run([sys.executable, "-I", "-c", code], user=uid, group=uid, extra_groups=[],
+                         capture_output=True, check=False, timeout=timeout + 5)
+    return res.returncode == 0
+
+
+def selftest(cfg: Config) -> tuple[dict, int]:
+    require_root()
+    enforce = cfg.mode == "enforce"
+    checks: dict[str, dict] = {}
+
+    def record(cid: str, ok: bool, msg: str, info: bool = False) -> None:
+        checks[cid] = {"ok": ok, "msg": msg, **({"info": True} if info else {})}
+
+    applied = read_state(cfg, "applied.json")
+    # E1: chains loaded and terminal verdict matches the mode.
+    res = subprocess.run(["nft", "-j", "list", "chain", cfg.nft["family"], cfg.nft["table"], cfg.nft["chain_out"]],
+                         capture_output=True, text=True, check=False)
+    verdicts: list[str] = []
+    if res.returncode == 0:
+        for item in json.loads(res.stdout).get("nftables", []):
+            rule = item.get("rule")
+            if rule:
+                verdicts.append(json.dumps(rule.get("expr", [])[-1:]))
+    want = "drop" if enforce else "accept"
+    record("E1", bool(verdicts) and want in verdicts[-1] and applied.get("mode") == cfg.mode,
+           f"egress_out has {len(verdicts)} rules, terminal verdict {want}, applied mode {applied.get('mode')}")
+    # E2: host proxy active and listening.
+    proxy_ip, proxy_port = cfg.host_proxy["listen"], int(cfg.host_proxy["port"])
+    state = host_proxy_state(cfg)
+    try:
+        socket.create_connection((proxy_ip, proxy_port), timeout=3).close()
+        listening = True
+    except OSError:
+        listening = False
+    record("E2", state == "active" and listening, f"{cfg.host_proxy['unit']} {state}, listening={listening}")
+    # E3: an allowlisted (pinned) host passes the host proxy.
+    pinned = [e for e in load_pinned(cfg) if e["role"] == "host" and e["port"] == 443]
+    if pinned:
+        target = f"{pinned[0]['host']}:443"
+        code = proxy_connect(proxy_ip, proxy_port, target)
+        if code == 200:
+            record("E3", True, f"CONNECT {target} -> 200")
+        elif code == 407:
+            record("E3", False, f"CONNECT {target} denied by the proxy (407)")
+        else:
+            record("E3", True, f"CONNECT {target} -> {code}: not denied (upstream unreachable)", info=True)
+    else:
+        record("E3", False, "no pinned host entry on port 443")
+    # E4: a name outside the allowlist is refused (enforce) / reported (observe).
+    code = proxy_connect(proxy_ip, proxy_port, "selftest.legatto.invalid:443")
+    if enforce:
+        record("E4", code == 407, f"CONNECT selftest.legatto.invalid -> {code} (want 407)")
+    else:
+        record("E4", code != 407 and code is not None, f"observe: CONNECT -> {code} (reported, not denied)")
+    # E5 / E6: a user outside the client list reaches neither the proxy nor the internet.
+    nobody = uid_of("nobody")
+    if nobody is None:
+        record("E5", False, "user nobody missing")
+        record("E6", False, "user nobody missing")
+    elif enforce:
+        reach_proxy = connect_as(nobody, proxy_ip, proxy_port)
+        record("E5", not reach_proxy, f"nobody -> {proxy_ip}:{proxy_port} connected={reach_proxy} (want False)")
+        reach_net = connect_as(nobody, "1.1.1.1", 443)
+        record("E6", not reach_net, f"nobody -> 1.1.1.1:443 connected={reach_net} (want False)")
+    else:
+        record("E5", True, "observe mode: proxy port is logged, not blocked", info=True)
+        record("E6", True, "observe mode: direct egress is logged, not blocked", info=True)
+    # E7: DNS black hole stays unassigned.
+    record("E7", *dns_blackhole_check(cfg))
+    # E8: resolver cut for Caddy and the console.
+    record("E8", *nodns_check(cfg))
+    # E9 / E10: container proxies and internal networks.
+    if docker_available():
+        record("E9", *container_proxy_check(cfg, applied))
+        record("E10", *internal_networks_check(cfg))
+    else:
+        record("E9", False, "docker not available")
+        record("E10", False, "docker not available")
+    ok = all(c["ok"] for c in checks.values())
+    return {"ok": ok, "mode": cfg.mode, "release": applied.get("release"), "ts": utc_now(),
+            "checks": checks}, (EXIT_OK if ok else EXIT_SELFTEST_FAILED)
+
+
+def dns_blackhole_check(cfg: Config) -> tuple[bool, str]:
+    ip = cfg.dns_blackhole
+    res = subprocess.run(["ip", "-j", "addr"], capture_output=True, text=True, check=False)
+    assigned = ip in res.stdout if res.returncode == 0 else False
+    daemon_ok = False
+    with contextlib.suppress(OSError, ValueError):
+        daemon = json.loads(Path(cfg.docker["daemon_json"]).read_text(encoding="utf-8"))
+        daemon_ok = daemon.get("dns") == [ip]
+    in_net = False
+    if docker_available():
+        net = subprocess.run(["docker", "network", "inspect", cfg.docker["host_network"]],
+                             capture_output=True, text=True, check=False)
+        in_net = f'"{ip}/' in net.stdout
+    ok = daemon_ok and not assigned and not in_net
+    return ok, f"daemon dns=[{ip}]: {daemon_ok}; assigned on host: {assigned}; used by a container: {in_net}"
+
+
+def nodns_check(cfg: Config) -> tuple[bool, str]:
+    msgs, ok = [], True
+    for unit in cfg.nodns_units:
+        if not unit_loaded(unit):
+            msgs.append(f"{unit}: not installed")
+            continue
+        res = subprocess.run(["systemctl", "show", "-p", "IPAddressDeny", "--value", unit],
+                             capture_output=True, text=True, check=False)
+        deny = res.stdout
+        good = "127.0.0.53" in deny or "::/0" in deny or "0.0.0.0/0" in deny
+        ok &= good
+        msgs.append(f"{unit}: resolver denied={good}")
+    return ok, "; ".join(msgs)
+
+
+def container_proxy_check(cfg: Config, applied: dict) -> tuple[bool, str]:
+    msgs, ok = [], True
+    for role in applied.get("roles_active", []):
+        if role == "host":
+            continue
+        ids = proxy_containers(cfg, role, all_states=False)
+        acl = cfg.p("proxy_dir") / role / "acl.yaml"
+        if not ids:
+            ok = False
+            msgs.append(f"{role}: proxy not running")
+            continue
+        res = subprocess.run(["docker", "inspect", "--format", "{{.State.StartedAt}}", ids[0]],
+                             capture_output=True, text=True, check=False)
+        started = res.stdout.strip()
+        try:
+            started_ts = dt.datetime.fromisoformat(started[:26].rstrip("Z") + "+00:00").timestamp()
+        except ValueError:
+            started_ts = 0.0
+        fresh = started_ts + 1 >= acl.stat().st_mtime if acl.exists() else False
+        ok &= fresh
+        msgs.append(f"{role}: running, ACL loaded={fresh}")
+    return ok, "; ".join(msgs) or "no active container role"
+
+
+def internal_networks_check(cfg: Config) -> tuple[bool, str]:
+    msgs, ok = [], True
+    for name in cfg.docker["internal_networks"]:
+        res = subprocess.run(["docker", "network", "inspect", "--format", "{{.Internal}}", name],
+                             capture_output=True, text=True, check=False)
+        internal = res.stdout.strip() == "true"
+        ok &= internal
+        msgs.append(f"{name}: internal={internal}")
+    return ok, "; ".join(msgs)
+
+
+# --------------------------------------------------------------------------- validate-data
+
+
+def validate_data(args: argparse.Namespace) -> dict:
+    if args.egress_json:
+        data = read_json(Path(args.egress_json), "egress")
+        egress = data.get("egress", data) if isinstance(data, dict) else data
+    else:
+        base = read_json(Path(args.base), "base")
+        feats = read_json(Path(args.features), "features")
+        if not isinstance(base, dict) or not isinstance(feats, dict):
+            raise invalid("base and features must be objects")
+        if base.get("version") != 1 or feats.get("version") != 1:
+            raise invalid("base.version and features.version must be 1")
+        egress = {"version": 1, "roles": base.get("roles"), "features": feats.get("features")}
+    v = validate_egress(None, egress)
+    return {"ok": True, "roles": {r: len(e) for r, e in v["roles"].items()},
+            "features": sorted(v["features"])}
+
+
+# --------------------------------------------------------------------------- CLI
+
+
+def build_parser() -> argparse.ArgumentParser:
+    p = argparse.ArgumentParser(prog="legatto-egress", description=__doc__.split("\n", 1)[0])
+    p.add_argument("--config", default=os.environ.get(CONFIG_ENV, DEFAULT_CONFIG),
+                   help=f"config.json written by the Ansible role (default {DEFAULT_CONFIG})")
+    p.add_argument("--version", action="version", version=GENERATOR)
+    sub = p.add_subparsers(dest="cmd", required=True)
+
+    s = sub.add_parser("render", help="render proxy configs, ACLs and egress.nft into a directory")
+    s.add_argument("--release-dir", required=True, help="release directory with manifest.json, or 'none'")
+    s.add_argument("--out", required=True)
+    s.add_argument("--json", action="store_true")
+
+    s = sub.add_parser("check", help="validate a rendered directory (ACL rules, consistency, nft -c)")
+    s.add_argument("--dir", required=True)
+    s.add_argument("--json", action="store_true")
+
+    s = sub.add_parser("diff", help="allowlist difference between two releases")
+    s.add_argument("--from", dest="from_dir", required=True, help="old release dir ('none' or missing = empty)")
+    s.add_argument("--to", dest="to_dir", required=True)
+    s.add_argument("--json", action="store_true")
+
+    s = sub.add_parser("apply", help="render + check + atomic switch + proxy restart")
+    s.add_argument("--release-dir", help="release directory (default: the current release)")
+    s.add_argument("--actor", help="audit actor JSON")
+    s.add_argument("--json", action="store_true")
+
+    s = sub.add_parser("status", help="egress.json (with --write: recount denials and write it)")
+    s.add_argument("--write", action="store_true")
+    s.add_argument("--json", action="store_true")
+
+    s = sub.add_parser("selftest", help="checks E1-E10 (release health check egress:selftest)")
+    s.add_argument("--json", action="store_true")
+
+    s = sub.add_parser("validate-data", help="validate allowlist data before it enters a release")
+    g = s.add_mutually_exclusive_group(required=True)
+    g.add_argument("--egress-json", help="manifest.json or its egress object (JSON)")
+    g.add_argument("--base", help="base allowlist as JSON (yq -o=json bundle/egress/base.yml)")
+    s.add_argument("--features", help="features allowlist as JSON (with --base)")
+    s.add_argument("--json", action="store_true")
+    return p
+
+
+def emit(args: argparse.Namespace, result: dict, human: str) -> None:
+    if getattr(args, "json", False):
+        print(json.dumps(result, sort_keys=True, ensure_ascii=False))
+    else:
+        print(human, file=sys.stderr)
+
+
+def main(argv: list[str] | None = None) -> int:
+    parser = build_parser()
+    try:
+        args = parser.parse_args(argv)
+    except SystemExit as exc:
+        return EXIT_OK if exc.code == 0 else EXIT_USAGE
+    try:
+        if args.cmd == "validate-data":
+            if args.base and not args.features:
+                raise EgressError("--base requires --features", EXIT_USAGE)
+            result = validate_data(args)
+            emit(args, result, "allowlist data valid")
+            return EXIT_OK
+        if args.cmd in ("apply", "selftest") or (args.cmd == "status" and args.write):
+            require_root()
+        cfg = Config(Path(args.config))
+        if args.cmd == "render":
+            result = render(cfg, args.release_dir, Path(args.out))
+            emit(args, result, f"rendered {len(result['files'])} files to {args.out}")
+            return EXIT_OK
+        if args.cmd == "check":
+            result = check(cfg, Path(args.dir))
+            emit(args, result, f"{args.dir}: OK")
+            return EXIT_OK
+        if args.cmd == "diff":
+            result, code = diff(cfg, args.from_dir, args.to_dir)
+            print(json.dumps(result, sort_keys=True, ensure_ascii=False))
+            if code == EXIT_PINNED_REMOVED:
+                log("release removes pinned entries: " +
+                    ", ".join(f"{e['role']}:{e['host']}:{e['port']}" for e in result["pinned_removed"]))
+            elif code == EXIT_WIDENING:
+                log(f"release widens egress ({len(result['widening_entries'])} entries); admin approval needed")
+            return code
+        if args.cmd == "apply":
+            release_dir = args.release_dir or str(cfg.p("current"))
+            actor = parse_actor(args.actor)
+            result = apply(cfg, release_dir, actor)
+            emit(args, result, f"applied release {result['release']} in mode {result['mode']}; "
+                               f"active roles: {', '.join(result['roles_active'])}")
+            for note in result["notes"]:
+                log(note)
+            return EXIT_OK
+        if args.cmd == "status":
+            result = status(cfg, args.write)
+            emit(args, result, f"mode {result['mode']}, denied_5m {result['denied_5m']}, ok {result['ok']}")
+            return EXIT_OK
+        if args.cmd == "selftest":
+            result, code = selftest(cfg)
+            human = "\n".join(f"{k}: {'PASS' if v['ok'] else 'FAIL'}{' (info)' if v.get('info') else ''} "
+                              f"{v['msg']}" for k, v in result["checks"].items())
+            emit(args, result, human)
+            return code
+        raise EgressError(f"unknown command {args.cmd}", EXIT_USAGE)
+    except EgressError as exc:
+        log(f"error: {exc}")
+        return exc.code
+    except Exception as exc:  # noqa: BLE001 - last-resort exit code 1 with a message
+        log(f"unexpected error: {exc.__class__.__name__}: {exc}")
+        return EXIT_ERROR
+
+
+if __name__ == "__main__":
+    sys.exit(main())

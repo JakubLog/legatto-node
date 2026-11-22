@@ -1,0 +1,26 @@
+---
+# Static checks of the public server code: pinning policy, YAML, shell, Python syntax, JSON schemas.
+name: lint
+on:
+  push:
+    branches: [main]
+  pull_request:
+permissions: {}
+concurrency:
+  group: lint-${{ github.ref }}
+  cancel-in-progress: true
+jobs:
+  lint:
+    name: lint
+    runs-on: ubuntu-24.04
+    timeout-minutes: 15
+    permissions:
+      contents: read
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1  # v7.0.1
+        with:
+          persist-credentials: false
+      - name: pinning policy
+        run: scripts/check-actions-pinned.sh
+      - name: lint
+        run: scripts/lint.sh

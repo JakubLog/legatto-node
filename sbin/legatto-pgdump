@@ -1,0 +1,418 @@
+#!/usr/bin/python3
+"""legatto-pgdump — consistent local pg_dump before the Hetzner backup window (U4).
+
+    legatto-pgdump run [--json] [--actor JSON]   root: dump, rotate, status/backup.json, audit
+    legatto-pgdump status [--json]                 contents of status/backup.json
+
+The Hetzner backup (disk image, owner = office) is the only backup. A disk
+image of a running PostgreSQL is crash-consistent at best, so this tool writes
+a logical dump into /var/backups/legatto/pg/ shortly before the window opens;
+every Hetzner backup then carries a transactionally consistent copy.
+
+One dump = one directory <UTC>/ with:
+    db.dump      pg_dump --format=custom of database `postgres`
+    globals.sql  pg_dumpall --globals-only (roles, needed to restore ownership)
+    meta.json    sizes, sha256, row counts and order-independent row checksums
+                 per table, all taken from the same exported snapshot as db.dump
+                 (numbers and hashes only, no table content)
+
+Exit codes: 0 ok, 1 unexpected, 2 arguments, 3 lock busy, 4 precondition,
+10 dump failed, 11 not enough free space.
+"""
+
+from __future__ import annotations
+
+import argparse
+import fcntl
+import hashlib
+import json
+import os
+import re
+import shutil
+import subprocess
+import sys
+import tempfile
+import time
+from datetime import datetime, timezone
+
+ROOT = os.environ.get("LEGATTO_ROOT", "")  # test hook; empty on servers
+
+PGDUMP_DIR = "/var/backups/legatto/pg"             # contract: legatto_paths.pgdump
+STATUS_DIR = "/var/lib/legatto/status"             # contract: legatto_paths.status
+OPS_CONF = "/etc/legatto/ops.json"                 # contract: legatto_paths.ops_conf
+RUN_DIR = "/run/legatto"                           # contract: legatto_paths.run
+STATUS_GROUP = "legatto-status"                    # contract: legatto_groups.status
+DB_CONTAINER = "supabase-db"                       # contract: legatto_container_db
+AUDIT_CLI = "/usr/local/sbin/legatto-audit"        # contract: legatto_cli.audit
+DEFAULT_ACTOR = {"kind": "system", "id": "legatto-pgdump"}
+DB_USER = "supabase_admin"
+DB_NAME = "postgres"
+WINDOW_RE = re.compile(r"^([01][0-9]|2[0-3])-([01][0-9]|2[0-3])$")
+DIR_RE = re.compile(r"^[0-9]{8}T[0-9]{6}Z$")
+MIN_FREE_BYTES = 512 * 1024 * 1024
+DUMP_TIMEOUT_SECONDS = 4 * 3600
+
+# Row count + order-independent checksum of every ordinary, permanent table
+# that pg_dump restores (extension member tables only when they are extension
+# configuration tables). Output: LGT|table|<rows>|<sum>|<qualified name>.
+# Identical in legatto-restore-test (tests/ops checks both copies).
+CHECKSUM_SQL = r"""SET LOCAL TimeZone = 'UTC';
+SET LOCAL DateStyle = 'ISO, YMD';
+SET LOCAL IntervalStyle = 'postgres';
+SET LOCAL extra_float_digits = 1;
+SET LOCAL bytea_output = 'hex';
+SELECT 'LGT|server_version_num|' || current_setting('server_version_num');
+SELECT format('SELECT %L || count(*) || %L || coalesce(sum((%L || substr(md5(t::text), 1, 16))::bit(64)::bigint::numeric), 0) || %L FROM %I.%I t',
+              'LGT|table|', '|', 'x', '|' || quote_ident(n.nspname) || '.' || quote_ident(c.relname), n.nspname, c.relname)
+FROM pg_class c JOIN pg_namespace n ON n.oid = c.relnamespace
+WHERE c.relkind = 'r' AND c.relpersistence = 'p'
+  AND n.nspname <> 'information_schema' AND n.nspname !~ '^pg_'
+  AND (NOT EXISTS (SELECT 1 FROM pg_depend d
+                   WHERE d.classid = 'pg_class'::regclass AND d.objid = c.oid AND d.deptype = 'e')
+       OR c.oid IN (SELECT unnest(extconfig) FROM pg_extension))
+ORDER BY n.nspname, c.relname \gexec
+"""
+
+# psql keeps a REPEATABLE READ transaction open, exports its snapshot, runs
+# pg_dump inside the container on that snapshot (dump bytes -> stdout) and
+# computes the checksums in the same transaction (marker lines -> stderr).
+DUMP_SCRIPT = (
+    "\\set ON_ERROR_STOP on\n"
+    "\\o | cat 1>&2\n"
+    "BEGIN ISOLATION LEVEL REPEATABLE READ, READ ONLY;\n"
+    "SELECT pg_export_snapshot() AS legatto_snap \\gset\n"
+    "\\setenv LEGATTO_SNAP :legatto_snap\n"
+    f"\\! pg_dump -h 127.0.0.1 -U {DB_USER} -d {DB_NAME} --format=custom --compress=6 "
+    "--snapshot=\"$LEGATTO_SNAP\" || echo 'LGT|pg_dump_failed' 1>&2\n"
+    + CHECKSUM_SQL
+    + "COMMIT;\n"
+)
+
+
+class Failure(Exception):
+    def __init__(self, code: int, message: str):
+        super().__init__(message)
+        self.code = code
+
+
+def path(p: str) -> str:
+    return ROOT + p
+
+
+def log(message: str) -> None:
+    print(f"legatto-pgdump: {message}", file=sys.stderr)
+
+
+def utc_now() -> datetime:
+    return datetime.now(timezone.utc).replace(microsecond=0)
+
+
+def fmt_ts(dt: datetime) -> str:
+    return dt.strftime("%Y-%m-%dT%H:%M:%SZ")
+
+
+def read_json(p: str) -> dict | None:
+    try:
+        with open(path(p), "rb") as fh:
+            data = json.loads(fh.read(1024 * 1024).decode("utf-8"))
+    except (OSError, UnicodeDecodeError, ValueError):
+        return None
+    return data if isinstance(data, dict) else None
+
+
+def fsync_dir(directory: str) -> None:
+    fd = os.open(directory, os.O_RDONLY | os.O_DIRECTORY)
+    try:
+        os.fsync(fd)
+    finally:
+        os.close(fd)
+
+
+def write_status(component: str, doc: dict) -> None:
+    directory = path(STATUS_DIR)
+    data = (json.dumps(doc, sort_keys=True, separators=(",", ":")) + "\n").encode("utf-8")
+    fd, tmp = tempfile.mkstemp(prefix=f".{component}.", suffix=".tmp", dir=directory)
+    try:
+        with os.fdopen(fd, "wb") as fh:
+            fh.write(data)
+            fh.flush()
+            os.fchmod(fh.fileno(), 0o640)
+            if not ROOT:
+                import grp
+                os.fchown(fh.fileno(), 0, grp.getgrnam(STATUS_GROUP).gr_gid)
+            os.fsync(fh.fileno())
+        os.rename(tmp, os.path.join(directory, f"{component}.json"))
+        fsync_dir(directory)
+    except BaseException:
+        try:
+            os.unlink(tmp)
+        except OSError:
+            pass
+        raise
+
+
+def audit(event: str, actor: dict, params: dict) -> int | None:
+    """Append one audit entry through legatto-audit (the single writer)."""
+    cmd = [path(AUDIT_CLI), "append", "--cat", "backup", "--event", event,
+           "--actor", json.dumps(actor, separators=(",", ":")),
+           "--params", json.dumps(params, sort_keys=True, separators=(",", ":"))]
+    try:
+        proc = subprocess.run(cmd, capture_output=True, timeout=60, check=False)
+    except (OSError, subprocess.TimeoutExpired):
+        log(f"audit {event}: legatto-audit not runnable")
+        return None
+    if proc.returncode != 0:
+        log(f"audit {event}: legatto-audit exit {proc.returncode}")
+        return None
+    try:
+        return int(json.loads(proc.stdout.decode("utf-8"))["seq"])
+    except (ValueError, KeyError, TypeError, UnicodeDecodeError):
+        return None
+
+
+def parse_actor(raw: str | None) -> dict:
+    if raw is None:
+        return dict(DEFAULT_ACTOR)
+    try:
+        actor = json.loads(raw)
+    except ValueError:
+        raise Failure(2, "--actor is not JSON") from None
+    if (not isinstance(actor, dict) or actor.get("kind") not in ("office-admin", "vendor", "system", "bootstrap")
+            or not isinstance(actor.get("id"), str) or not re.fullmatch(r"[a-z][a-z0-9.-]{1,40}", actor["id"])):
+        raise Failure(2, "--actor must be {\"kind\":…,\"id\":…}")
+    return {"kind": actor["kind"], "id": actor["id"]}
+
+
+def load_conf() -> tuple[str | None, int]:
+    conf = read_json(OPS_CONF)
+    if conf is None:
+        raise Failure(4, f"{OPS_CONF} missing (monitoring role)")
+    window = conf.get("hetzner_backup_window")
+    if window is not None and (not isinstance(window, str) or not WINDOW_RE.match(window)):
+        raise Failure(4, "hetzner_backup_window in ops.json must be HH-HH")
+    keep = conf.get("pgdump_keep")
+    if isinstance(keep, bool) or not isinstance(keep, int) or not 1 <= keep <= 14:
+        raise Failure(4, "pgdump_keep in ops.json must be 1..14")
+    return window, keep
+
+
+def dump_dirs(base: str) -> list[str]:
+    try:
+        names = os.listdir(base)
+    except FileNotFoundError:
+        return []
+    return sorted(n for n in names if DIR_RE.match(n) and os.path.isfile(os.path.join(base, n, "meta.json")))
+
+
+def stream_to_file(cmd: list[str], target: str, stdin_data: bytes | None) -> tuple[int, int, str, list[str]]:
+    """Run cmd, write stdout to target while hashing; keep only LGT| marker lines of stderr."""
+    digest = hashlib.sha256()
+    size = 0
+    markers: list[str] = []
+    with open(target, "xb") as out, tempfile.TemporaryFile() as err:
+        os.fchmod(out.fileno(), 0o600)
+        proc = subprocess.Popen(cmd, stdin=subprocess.PIPE if stdin_data is not None else subprocess.DEVNULL,
+                                stdout=subprocess.PIPE, stderr=err)
+        if stdin_data is not None:
+            assert proc.stdin is not None
+            proc.stdin.write(stdin_data)
+            proc.stdin.close()
+        assert proc.stdout is not None
+        deadline = time.monotonic() + DUMP_TIMEOUT_SECONDS
+        while True:
+            chunk = proc.stdout.read(1024 * 1024)
+            if not chunk:
+                break
+            out.write(chunk)
+            digest.update(chunk)
+            size += len(chunk)
+            if time.monotonic() > deadline:
+                proc.kill()
+                break
+        rc = proc.wait()
+        out.flush()
+        os.fsync(out.fileno())
+        err.seek(0)
+        for line in err:
+            if line.startswith(b"LGT|"):
+                markers.append(line.decode("utf-8", "replace").rstrip("\n"))
+    return rc, size, digest.hexdigest(), markers
+
+
+def parse_markers(markers: list[str]) -> tuple[dict, list[dict]]:
+    info: dict = {}
+    tables: list[dict] = []
+    for line in markers:
+        parts = line.split("|", 4)
+        kind = parts[1] if len(parts) > 1 else ""
+        if kind == "table" and len(parts) == 5 and re.fullmatch(r"[0-9]+", parts[2]) \
+                and re.fullmatch(r"-?[0-9]+", parts[3]):
+            tables.append({"name": parts[4], "rows": int(parts[2]),
+                           "sum": hashlib.sha256(f"{parts[2]}:{parts[3]}".encode()).hexdigest()[:16]})
+        elif kind == "server_version_num" and len(parts) == 3:
+            info["server_version_num"] = parts[2]
+        elif kind == "pg_dump_failed":
+            info["pg_dump_failed"] = True
+    return info, tables
+
+
+def lock():
+    os.makedirs(path(RUN_DIR), mode=0o755, exist_ok=True)
+    fh = open(path(f"{RUN_DIR}/pgdump.lock"), "a")
+    try:
+        fcntl.flock(fh, fcntl.LOCK_EX | fcntl.LOCK_NB)
+    except BlockingIOError:
+        fh.close()
+        raise Failure(3, "another legatto-pgdump is running")
+    return fh
+
+
+def status_doc(prev: dict | None, window: str | None, now: datetime, state: str, result: dict | None) -> dict:
+    prev_pg = (prev or {}).get("pgdump") if isinstance((prev or {}).get("pgdump"), dict) else {}
+    pg = {"state": state, "last_run_at": fmt_ts(now), "last_ok_at": prev_pg.get("last_ok_at"),
+          "bytes": prev_pg.get("bytes"), "sha256": prev_pg.get("sha256")}
+    if result is not None:
+        pg.update(last_ok_at=result["finished_at"], bytes=result["bytes"], sha256=result["sha256"])
+    return {"v": 1, "component": "backup", "ts": fmt_ts(utc_now()), "ok": state == "ok" and bool(window),
+            "pgdump": pg, "hetzner_window": window}
+
+
+def do_dump(base: str, now: datetime) -> dict:
+    name = now.strftime("%Y%m%dT%H%M%SZ")
+    work = os.path.join(base, f".{name}.partial")
+    os.makedirs(work, mode=0o700)
+    started = time.monotonic()
+    try:
+        psql = ["docker", "exec", "-i", DB_CONTAINER, "psql", "-h", "127.0.0.1", "-U", DB_USER, "-d", DB_NAME,
+                "-X", "-q", "-A", "-t", "-f", "-"]
+        rc, size, sha, markers = stream_to_file(psql, os.path.join(work, "db.dump"), DUMP_SCRIPT.encode())
+        info, tables = parse_markers(markers)
+        if rc != 0 or info.get("pg_dump_failed") or size < 5 or not tables:
+            raise Failure(10, f"pg_dump failed (psql exit {rc}, {size} bytes, {len(tables)} tables)")
+        with open(os.path.join(work, "db.dump"), "rb") as fh:
+            if fh.read(5) != b"PGDMP":
+                raise Failure(10, "pg_dump output is not a custom-format archive")
+        grc, gsize, gsha, _ = stream_to_file(
+            ["docker", "exec", DB_CONTAINER, "pg_dumpall", "-h", "127.0.0.1", "-U", DB_USER, "--globals-only"],
+            os.path.join(work, "globals.sql"), None)
+        if grc != 0 or gsize == 0:
+            raise Failure(10, f"pg_dumpall --globals-only failed (exit {grc})")
+        finished = utc_now()
+        meta = {"v": 1, "name": name, "created_at": fmt_ts(now), "finished_at": fmt_ts(finished),
+                "duration_s": int(time.monotonic() - started),
+                "server_version_num": info.get("server_version_num"),
+                "db": {"file": "db.dump", "bytes": size, "sha256": sha},
+                "globals": {"file": "globals.sql", "bytes": gsize, "sha256": gsha},
+                "tables": tables}
+        with open(os.path.join(work, "meta.json"), "x", encoding="utf-8") as fh:
+            os.fchmod(fh.fileno(), 0o600)
+            json.dump(meta, fh, sort_keys=True, indent=1)
+            fh.write("\n")
+            fh.flush()
+            os.fsync(fh.fileno())
+        fsync_dir(work)
+        os.rename(work, os.path.join(base, name))
+        fsync_dir(base)
+    except BaseException:
+        shutil.rmtree(work, ignore_errors=True)
+        raise
+    return {"name": name, "bytes": size, "sha256": sha, "tables": len(tables),
+            "duration_s": meta["duration_s"], "finished_at": meta["finished_at"]}
+
+
+def rotate(base: str, keep: int) -> list[str]:
+    removed = []
+    for name in os.listdir(base):
+        if name.startswith(".") and name.endswith(".partial"):
+            shutil.rmtree(os.path.join(base, name), ignore_errors=True)
+    complete = dump_dirs(base)
+    for name in complete[:-keep] if len(complete) > keep else []:
+        shutil.rmtree(os.path.join(base, name))
+        removed.append(name)
+    return removed
+
+
+def check_space(base: str) -> None:
+    previous = dump_dirs(base)
+    need = MIN_FREE_BYTES
+    if previous:
+        meta = read_json(f"{PGDUMP_DIR}/{previous[-1]}/meta.json") or {}
+        last = meta.get("db", {}).get("bytes") if isinstance(meta.get("db"), dict) else None
+        if isinstance(last, int):
+            need = max(need, 2 * last)
+    st = os.statvfs(base)
+    if st.f_bavail * st.f_frsize < need:
+        raise Failure(11, f"less than {need // (1024 * 1024)} MiB free in {PGDUMP_DIR}")
+
+
+def cmd_run(args: argparse.Namespace) -> int:
+    actor = parse_actor(args.actor)
+    if not ROOT and os.geteuid() != 0:
+        raise Failure(4, "run must be root")
+    window, keep = load_conf()
+    base = path(PGDUMP_DIR)
+    os.makedirs(base, mode=0o700, exist_ok=True)
+    os.chmod(base, 0o700)
+    guard = lock()
+    try:
+        now = utc_now()
+        prev = read_json(f"{STATUS_DIR}/backup.json")
+        write_status("backup", status_doc(prev, window, now, "run", None))
+        try:
+            check_space(base)
+            result = do_dump(base, now)
+        except Failure as exc:
+            write_status("backup", status_doc(prev, window, now, "fail", None))
+            audit("backup.pgdump", actor, {"result": "fail", "exit": exc.code})
+            raise
+        removed = rotate(base, keep)
+        write_status("backup", status_doc(prev, window, now, "ok", result))
+        seq = audit("backup.pgdump", actor, {"result": "ok", "dump": result["name"], "bytes": result["bytes"],
+                                             "sha256": result["sha256"], "tables": result["tables"],
+                                             "duration_s": result["duration_s"], "rotated": len(removed)})
+    finally:
+        guard.close()
+    out = dict(result, removed=removed, audit_seq=seq)
+    if args.json:
+        print(json.dumps(out, sort_keys=True, separators=(",", ":")))
+    else:
+        log(f"ok: {result['name']} ({result['bytes']} bytes, {result['tables']} tables)")
+    return 0 if seq is not None else 1
+
+
+def cmd_status(args: argparse.Namespace) -> int:
+    doc = read_json(f"{STATUS_DIR}/backup.json")
+    if doc is None:
+        raise Failure(4, "no status/backup.json yet")
+    if args.json:
+        print(json.dumps(doc, sort_keys=True, separators=(",", ":")))
+    else:
+        pg = doc.get("pgdump") or {}
+        print(f"pgdump={pg.get('state')} last_ok_at={pg.get('last_ok_at')} hetzner_window={doc.get('hetzner_window')}")
+    return 0
+
+
+def main(argv: list[str]) -> int:
+    parser = argparse.ArgumentParser(prog="legatto-pgdump", description=__doc__.split("\n")[0])
+    sub = parser.add_subparsers(dest="command", required=True)
+    p_run = sub.add_parser("run", help="dump, rotate, write status/backup.json (root)")
+    p_run.add_argument("--json", action="store_true")
+    p_run.add_argument("--actor", help='audit actor, default {"kind":"system","id":"legatto-pgdump"}')
+    p_status = sub.add_parser("status", help="show status/backup.json")
+    p_status.add_argument("--json", action="store_true")
+    try:
+        args = parser.parse_args(argv)
+    except SystemExit as exc:
+        return 2 if exc.code else 0
+    try:
+        return cmd_run(args) if args.command == "run" else cmd_status(args)
+    except Failure as exc:
+        log(str(exc))
+        return exc.code
+    except Exception as exc:  # noqa: BLE001
+        log(f"unexpected error: {type(exc).__name__}: {exc}")
+        return 1
+
+
+if __name__ == "__main__":
+    sys.exit(main(sys.argv[1:]))

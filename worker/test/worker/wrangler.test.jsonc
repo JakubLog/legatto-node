@@ -1,0 +1,15 @@
+// Test-only Worker configuration (vitest). Production configuration is
+// rendered on the office server by legatto-worker-deploy (tools/worker.ts).
+{
+  "name": "legatto-forms",
+  "main": "../../src/index.ts",
+  "compatibility_date": "2026-11-01",
+  "workers_dev": false,
+  "queues": { "producers": [{ "queue": "forms", "binding": "FORMS" }] },
+  "ratelimits": [
+    { "name": "RL_IP", "namespace_id": "1001", "simple": { "limit": 2, "period": 60 } },
+    { "name": "RL_GLOBAL", "namespace_id": "1002", "simple": { "limit": 30, "period": 60 } },
+    { "name": "RL_SELFTEST", "namespace_id": "1003", "simple": { "limit": 2, "period": 60 } }
+  ],
+  "observability": { "enabled": false }
+}

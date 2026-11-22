@@ -1,0 +1,345 @@
+# Legatto override for the vendored Supabase self-hosted compose file
+# (compose/supabase/docker-compose.yml, tag self-hosted/v0.8.4, never edited).
+#
+# Invocation (legatto-stack, updater):
+#   docker compose -p legatto --project-directory <rel>/compose/supabase \
+#     -f <rel>/compose/supabase/docker-compose.yml -f <rel>/compose/docker-compose.legatto.yml \
+#     --env-file /run/legatto/env/compose.env ...
+#
+# Rules (docs/CONTRACT.md §4.8, contract.yml):
+#   - every image is "@@LEGATTO_IMAGE:<name>@@" (legatto_image_names); release/build.sh
+#     replaces it with <repository>@sha256:<digest> from manifest.images[]; servers never pull;
+#   - no published ports (Caddy on the host reaches app/api-gw on legatto-host);
+#   - networks, bridge names and fixed addresses: legatto_docker_networks, legatto_ip_host_net,
+#     legatto_ip_int_net, legatto_egress_container_proxies;
+#   - data lives in named volumes, never in the per-release directory;
+#   - ${...} values come from compose.env (rendered by legatto-secrets from env/compose.env.tmpl);
+#     per-service env files live in ${LEGATTO_RUN_ENV_DIR} (default /run/legatto/env).
+
+---
+name: legatto
+
+x-legatto-hardening: &hardening
+  pull_policy: never
+  restart: unless-stopped
+  security_opt:
+    - no-new-privileges:true
+
+networks:
+  default:
+    name: legatto-int
+    internal: true
+    driver_opts:
+      com.docker.network.bridge.name: br-lgt-int
+    ipam:
+      config:
+        - subnet: 172.30.1.0/24
+          gateway: 172.30.1.1
+          ip_range: 172.30.1.128/25
+  legatto-host:
+    name: legatto-host
+    internal: false
+    driver_opts:
+      com.docker.network.bridge.name: br-legatto
+    ipam:
+      config:
+        - subnet: 172.30.0.0/24
+          gateway: 172.30.0.1
+          ip_range: 172.30.0.192/26
+  legatto-egress-ext:
+    name: legatto-egress-ext
+    internal: false
+    driver_opts:
+      com.docker.network.bridge.name: br-lgt-egx
+    ipam:
+      config:
+        - subnet: 172.30.255.0/24
+          gateway: 172.30.255.1
+  legatto-egress-app:
+    name: legatto-egress-app
+    internal: true
+    driver_opts:
+      com.docker.network.bridge.name: br-lgt-eapp
+    ipam:
+      config:
+        - subnet: 172.30.2.0/24
+  legatto-egress-auth:
+    name: legatto-egress-auth
+    internal: true
+    driver_opts:
+      com.docker.network.bridge.name: br-lgt-eauth
+    ipam:
+      config:
+        - subnet: 172.30.3.0/24
+  legatto-egress-fn:
+    name: legatto-egress-fn
+    internal: true
+    driver_opts:
+      com.docker.network.bridge.name: br-lgt-efn
+    ipam:
+      config:
+        - subnet: 172.30.4.0/24
+  legatto-egress-intake:
+    name: legatto-egress-intake
+    internal: true
+    driver_opts:
+      com.docker.network.bridge.name: br-lgt-eintk
+    ipam:
+      config:
+        - subnet: 172.30.5.0/24
+  legatto-egress-publish:
+    name: legatto-egress-publish
+    internal: true
+    driver_opts:
+      com.docker.network.bridge.name: br-lgt-epub
+    ipam:
+      config:
+        - subnet: 172.30.6.0/24
+
+volumes:
+  db-data:
+  storage-data:
+  studio-snippets:
+
+secrets:
+  pii_field_key:
+    file: /run/legatto/keys/pii_field_key
+
+services:
+  db:
+    <<: *hardening
+    image: "@@LEGATTO_IMAGE:db@@"
+    stop_grace_period: 60s
+    networks:
+      default: {}
+      legatto-host:
+        ipv4_address: 172.30.0.2
+    # pg_net hairpin: https://app.<domain>/api/notifications resolves to the
+    # tailnet IPv4 where Caddy listens (nft accepts only 172.30.0.2 -> ts_ip4:443).
+    extra_hosts:
+      - "${LEGATTO_HOST_CRM}:${LEGATTO_TS_IP4}"
+    volumes:
+      # Replaces the upstream bind ./volumes/db/data (merged by target path).
+      - db-data:/var/lib/postgresql/data
+      # Upstream init scripts, re-declared read-only (same targets; paths relative to
+      # the project directory compose/supabase).
+      - ./volumes/db/realtime.sql:/docker-entrypoint-initdb.d/migrations/99-realtime.sql:ro
+      - ./volumes/db/webhooks.sql:/docker-entrypoint-initdb.d/init-scripts/98-webhooks.sql:ro
+      - ./volumes/db/roles.sql:/docker-entrypoint-initdb.d/init-scripts/99-roles.sql:ro
+      - ./volumes/db/jwt.sql:/docker-entrypoint-initdb.d/init-scripts/99-jwt.sql:ro
+      - ./volumes/db/_supabase.sql:/docker-entrypoint-initdb.d/migrations/97-_supabase.sql:ro
+      - ./volumes/db/logs.sql:/docker-entrypoint-initdb.d/migrations/99-logs.sql:ro
+      - ./volumes/db/pooler.sql:/docker-entrypoint-initdb.d/migrations/99-pooler.sql:ro
+    # First start runs the image's init scripts with postgres listening on the socket
+    # only; give it time before failed probes count (`up --wait` would give up otherwise).
+    healthcheck:
+      start_period: 180s
+      start_interval: 5s
+    # Upstream command plus legatto.surface_enforce (A5): admin-only RPCs and functions
+    # refuse requests without X-Legatto-Surface: admin. A placeholder GUC set with
+    # ALTER DATABASE needs SUPERUSER, which the migrator does not have; `command` replaces
+    # the upstream list as a whole.
+    command:
+      - postgres
+      - -c
+      - config_file=/etc/postgresql/postgresql.conf
+      - -c
+      - log_min_messages=fatal
+      - -c
+      - legatto.surface_enforce=on
+
+  auth:
+    <<: *hardening
+    image: "@@LEGATTO_IMAGE:auth@@"
+    networks:
+      default: {}
+      legatto-egress-auth: {}
+    # GoTrue accepts http:// hooks only for localhost/host.docker.internal;
+    # the name points at the app's fixed address on legatto-int (:3001 internal listener).
+    extra_hosts:
+      - "host.docker.internal:172.30.1.10"
+    env_file:
+      - ${LEGATTO_RUN_ENV_DIR:-/run/legatto/env}/auth.env
+
+  rest:
+    <<: *hardening
+    image: "@@LEGATTO_IMAGE:rest@@"
+
+  realtime:
+    <<: *hardening
+    image: "@@LEGATTO_IMAGE:realtime@@"
+
+  storage:
+    <<: *hardening
+    image: "@@LEGATTO_IMAGE:storage@@"
+    depends_on: !override
+      db:
+        condition: service_healthy
+      rest:
+        condition: service_started
+    environment:
+      ENABLE_IMAGE_TRANSFORMATION: "false"
+      IMGPROXY_URL: !reset null
+    volumes:
+      # Replaces the upstream bind ./volumes/storage (merged by target path).
+      - storage-data:/var/lib/storage
+
+  imgproxy:
+    profiles: [disabled]
+
+  supavisor:
+    profiles: [disabled]
+    ports: !reset []
+
+  meta:
+    <<: *hardening
+    image: "@@LEGATTO_IMAGE:meta@@"
+    profiles: [admin]
+
+  studio:
+    <<: *hardening
+    image: "@@LEGATTO_IMAGE:studio@@"
+    profiles: [admin]
+    environment:
+      OPENAI_API_KEY: !reset null
+      NEXT_TELEMETRY_DISABLED: "1"
+    volumes: !override
+      - studio-snippets:/app/snippets
+
+  api-gw:
+    <<: *hardening
+    image: "@@LEGATTO_IMAGE:api-gw@@"
+    # Upstream waits for a healthy Studio; Studio is optional (profile admin).
+    depends_on: !reset []
+    ports: !reset []
+    networks:
+      legatto-host:
+        ipv4_address: 172.30.0.11
+
+  functions:
+    <<: *hardening
+    image: "@@LEGATTO_IMAGE:functions@@"
+    user: "65532:65532"
+    read_only: true
+    tmpfs:
+      - /tmp
+    cap_drop: [ALL]
+    networks:
+      default: {}
+      legatto-egress-fn: {}
+    # Code and module cache are baked into the image: nothing from the host, no runtime fetch.
+    volumes: !reset []
+    env_file:
+      - ${LEGATTO_RUN_ENV_DIR:-/run/legatto/env}/functions.env
+    environment:
+      # Functions do not use the database URL; keep the postgres password out of this container.
+      SUPABASE_DB_URL: !reset null
+
+  app:
+    <<: *hardening
+    image: "@@LEGATTO_IMAGE:app@@"
+    user: "65532:65532"
+    read_only: true
+    tmpfs:
+      - /tmp
+    cap_drop: [ALL]
+    stop_grace_period: 320s
+    networks:
+      default:
+        ipv4_address: 172.30.1.10
+      legatto-host:
+        ipv4_address: 172.30.0.10
+      legatto-egress-app: {}
+    env_file:
+      - ${LEGATTO_RUN_ENV_DIR:-/run/legatto/env}/app.env
+    secrets:
+      - pii_field_key
+    depends_on:
+      api-gw:
+        condition: service_healthy
+    healthcheck:
+      test: ["CMD", "/nodejs/bin/node", "/app/server/healthcheck.mjs"]
+      interval: 15s
+      timeout: 6s
+      retries: 3
+      start_period: 60s
+
+  # One-shot: `docker compose --profile tools run --rm migrator migrate|status --json|check`.
+  migrator:
+    pull_policy: never
+    image: "@@LEGATTO_IMAGE:migrator@@"
+    profiles: [tools]
+    user: "65532:65532"
+    read_only: true
+    tmpfs:
+      - /tmp
+    cap_drop: [ALL]
+    security_opt:
+      - no-new-privileges:true
+    networks:
+      default: {}
+    env_file:
+      - ${LEGATTO_RUN_ENV_DIR:-/run/legatto/env}/migrator.env
+    command: ["migrate"]
+    depends_on:
+      # Migrations reference auth.users and storage.buckets: GoTrue and storage-api
+      # create their schemas at start, so both must be healthy first (first install).
+      db:
+        condition: service_healthy
+      auth:
+        condition: service_healthy
+      storage:
+        condition: service_healthy
+
+  # Egress proxies (Smokescreen, image built from egress/image/Dockerfile).
+  # Configuration: legatto-egress renders /etc/legatto/egress/proxy/<role>/
+  # {smokescreen.yaml,acl.yaml}; mode observe|enforce lives in the ACL.
+  egress-app: &egress_proxy
+    <<: *hardening
+    image: "@@LEGATTO_IMAGE:egress-proxy@@"
+    user: "65532:65532"
+    read_only: true
+    cap_drop: [ALL]
+    command: ["--config-file", "/etc/smokescreen/smokescreen.yaml"]
+    volumes:
+      - /etc/legatto/egress/proxy/app:/etc/smokescreen:ro
+    networks:
+      legatto-egress-app: {}
+      legatto-egress-ext:
+        ipv4_address: 172.30.255.2
+
+  egress-auth:
+    <<: *egress_proxy
+    volumes:
+      - /etc/legatto/egress/proxy/auth:/etc/smokescreen:ro
+    networks:
+      legatto-egress-auth: {}
+      legatto-egress-ext:
+        ipv4_address: 172.30.255.3
+
+  egress-fn:
+    <<: *egress_proxy
+    volumes:
+      - /etc/legatto/egress/proxy/functions:/etc/smokescreen:ro
+    networks:
+      legatto-egress-fn: {}
+      legatto-egress-ext:
+        ipv4_address: 172.30.255.4
+
+  egress-intake:
+    <<: *egress_proxy
+    volumes:
+      - /etc/legatto/egress/proxy/intake:/etc/smokescreen:ro
+    networks:
+      legatto-egress-intake: {}
+      legatto-egress-ext:
+        ipv4_address: 172.30.255.5
+
+  egress-publish:
+    <<: *egress_proxy
+    volumes:
+      - /etc/legatto/egress/proxy/publish:/etc/smokescreen:ro
+    networks:
+      legatto-egress-publish: {}
+      legatto-egress-ext:
+        ipv4_address: 172.30.255.6

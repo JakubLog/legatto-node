@@ -1,0 +1,515 @@
+#!/usr/bin/python3
+"""legatto-policy — render, check, apply and assert the Headscale policy.
+
+CONTRACT §4.6. Inputs:
+    /etc/legatto/policy/acl.hujson.j2   template (repo headscale/acl.hujson.j2, Ansible)
+    /etc/legatto/policy/static.json     ts_ip4, ts_ip6, vendors, tags, groups, ports (Ansible)
+    /var/lib/legatto/tailnet/staff.json staff logins (office console via legatto-tailnet)
+    /var/lib/legatto/breakglass/state.json  active window (legatto-breakglass)
+Outputs:
+    /etc/legatto/policy/{normal,breakglass}.hujson
+    /etc/headscale/policy.hujson        the active variant (atomic replace + reload)
+
+Subcommands: render, check, apply, assert [--expect normal|breakglass].
+Exit codes: 0 OK, 1 error, 2 bad arguments, 3 lock busy, 4 precondition,
+22 `headscale policy check` rejected the policy, 23 PacketFilter assertion failed.
+
+Rendering uses python3-jinja2 from Ubuntu main in a SandboxedEnvironment with
+StrictUndefined (the only exception to the stdlib rule, CONTRACT §1.5).
+"""
+
+from __future__ import annotations
+
+import argparse
+import ipaddress
+import json
+import os
+import sys
+import tempfile
+import time
+
+if os.environ.get("LEGATTO_TEST_ROOT") and os.environ.get("LEGATTO_NET_LIB"):
+    sys.path.insert(0, os.environ["LEGATTO_NET_LIB"])
+sys.path.insert(1, os.path.join(os.path.dirname(os.path.realpath(__file__)), "..", "lib", "net"))
+import legatto_net as ln  # noqa: E402
+
+EXIT_CHECK = 22
+EXIT_ASSERT = 23
+TEMPLATE = os.path.join(ln.POLICY_DIR, "acl.hujson.j2")
+STATIC = os.path.join(ln.POLICY_DIR, "static.json")
+STAFF = os.path.join(ln.TAILNET_DIR, "staff.json")
+STATE = os.path.join(ln.BREAKGLASS_DIR, "state.json")
+LOCK = os.path.join(ln.RUN_DIR, "policy.lock")
+VARIANTS = ("normal", "breakglass")
+HEADSCALE_GROUP = "headscale"
+SSH_PORT_DEFAULT = 22  # contract: legatto_ports.tailnet.ssh
+HTTPS_PORT_DEFAULT = 443  # contract: legatto_ports.tailnet.https
+# Largest aggregated source prefix accepted in the server PacketFilter (a /24
+# for IPv4, /120 for IPv6); anything wider means a wildcard-like grant.
+MAX_SOURCE_ADDRESSES = 256
+
+
+# --- HuJSON ------------------------------------------------------------------------------
+
+def hujson_to_json(text: str) -> object:
+    """Parse HuJSON (JSON + comments + trailing commas) with the stdlib parser."""
+    out = []
+    i, n = 0, len(text)
+    in_string = False
+    while i < n:
+        ch = text[i]
+        if in_string:
+            out.append(ch)
+            if ch == "\\" and i + 1 < n:
+                out.append(text[i + 1])
+                i += 2
+                continue
+            if ch == '"':
+                in_string = False
+            i += 1
+            continue
+        if ch == '"':
+            in_string = True
+            out.append(ch)
+            i += 1
+        elif text.startswith("//", i):
+            j = text.find("\n", i)
+            i = n if j < 0 else j
+        elif text.startswith("/*", i):
+            j = text.find("*/", i + 2)
+            if j < 0:
+                raise ValueError("unterminated block comment")
+            i = j + 2
+        else:
+            out.append(ch)
+            i += 1
+    cleaned = "".join(out)
+    # Remove trailing commas: a comma followed only by whitespace and } or ].
+    result = []
+    in_string = False
+    k = 0
+    while k < len(cleaned):
+        ch = cleaned[k]
+        if in_string:
+            result.append(ch)
+            if ch == "\\" and k + 1 < len(cleaned):
+                result.append(cleaned[k + 1])
+                k += 2
+                continue
+            if ch == '"':
+                in_string = False
+            k += 1
+            continue
+        if ch == '"':
+            in_string = True
+        elif ch == ",":
+            m = k + 1
+            while m < len(cleaned) and cleaned[m] in " \t\r\n":
+                m += 1
+            if m < len(cleaned) and cleaned[m] in "}]":
+                k += 1
+                continue
+        result.append(ch)
+        k += 1
+    return json.loads("".join(result))
+
+
+# --- inputs -------------------------------------------------------------------------------
+
+def load_static(path: str) -> dict:
+    doc = ln.read_json(path)
+    if not isinstance(doc, dict):
+        raise ln.ToolError(f"{path}: missing or not an object", ln.EXIT_PRECOND)
+    try:
+        ts4 = ipaddress.ip_address(doc["ts_ip4"])
+        ts6 = ipaddress.ip_address(doc["ts_ip6"])
+    except (KeyError, ValueError) as exc:
+        raise ln.ToolError(f"{path}: ts_ip4/ts_ip6 missing or invalid", ln.EXIT_PRECOND) from exc
+    if ts4.version != 4 or ts4 not in ln.PREFIX_V4 or ts6.version != 6 or ts6 not in ln.PREFIX_V6:
+        raise ln.ToolError(f"{path}: ts_ip4/ts_ip6 outside the tailnet prefixes", ln.EXIT_PRECOND)
+    vendors = doc.get("vendors", [])
+    if not isinstance(vendors, list) or not all(isinstance(v, str) and ln.VENDOR_RE.match(v) for v in vendors):
+        raise ln.ToolError(f"{path}: vendors must be v-<name> logins", ln.EXIT_PRECOND)
+    tags = doc.get("tags") or {"server": ln.TAG_SERVER, "office_device": ln.TAG_OFFICE}
+    groups = doc.get("groups") or {"staff": "group:staff", "vendor": "group:vendor"}
+    ports = doc.get("ports") or {"ssh": SSH_PORT_DEFAULT, "https": HTTPS_PORT_DEFAULT}
+    for key in ("server", "office_device"):
+        if not str(tags.get(key, "")).startswith("tag:"):
+            raise ln.ToolError(f"{path}: tags.{key} must start with tag:", ln.EXIT_PRECOND)
+    for key in ("staff", "vendor"):
+        if not str(groups.get(key, "")).startswith("group:"):
+            raise ln.ToolError(f"{path}: groups.{key} must start with group:", ln.EXIT_PRECOND)
+    for key in ("ssh", "https"):
+        if not isinstance(ports.get(key), int) or not 0 < ports[key] < 65536:
+            raise ln.ToolError(f"{path}: ports.{key} must be a TCP port", ln.EXIT_PRECOND)
+    return {"ts_ip4": str(ts4), "ts_ip6": str(ts6), "vendors": sorted(set(vendors)),
+            "tags": {k: tags[k] for k in ("server", "office_device")},
+            "groups": {k: groups[k] for k in ("staff", "vendor")},
+            "ports": {k: ports[k] for k in ("ssh", "https")}}
+
+
+def load_staff(path: str) -> list:
+    doc = ln.read_json(path, default={"v": 1, "staff": []})
+    staff = doc.get("staff") if isinstance(doc, dict) else None
+    if not isinstance(staff, list) or not all(isinstance(s, str) and ln.STAFF_RE.match(s) for s in staff):
+        raise ln.ToolError(f"{path}: staff must be a list of logins", ln.EXIT_PRECOND)
+    if any(ln.VENDOR_RE.match(s) for s in staff):
+        raise ln.ToolError(f"{path}: staff logins may not use the vendor prefix v-", ln.EXIT_PRECOND)
+    return sorted(set(staff))
+
+
+def load_window(path: str) -> dict | None:
+    """Active, unexpired window from the break-glass state, else None."""
+    state = ln.read_json(path, default={})
+    if not isinstance(state, dict) or not state.get("active"):
+        return None
+    try:
+        expires = ln.parse_ts(state["expires_at"])
+    except (KeyError, ValueError):
+        return None
+    if ln.now() >= expires:
+        return None
+    return {"window_id": state.get("window_id", ""), "expires_at": state["expires_at"]}
+
+
+def active_variant(state_path: str) -> str:
+    return "breakglass" if load_window(state_path) else "normal"
+
+
+# --- render -------------------------------------------------------------------------------
+
+def render_variants(template_path: str, static: dict, staff: list, window: dict | None) -> dict:
+    try:
+        from jinja2 import StrictUndefined
+        from jinja2.sandbox import SandboxedEnvironment
+    except ImportError as exc:
+        raise ln.ToolError("python3-jinja2 is not installed", ln.EXIT_PRECOND) from exc
+    try:
+        with open(template_path, encoding="utf-8") as fh:
+            source = fh.read()
+    except FileNotFoundError as exc:
+        raise ln.ToolError(f"{template_path}: missing", ln.EXIT_PRECOND) from exc
+    env = SandboxedEnvironment(undefined=StrictUndefined, autoescape=False, keep_trailing_newline=True)
+    env.filters["tailnet_user"] = lambda login: f"{login}@"
+    template = env.from_string(source)
+    overlap = set(staff) & set(static["vendors"])
+    if overlap:
+        raise ln.ToolError(f"logins both staff and vendor: {', '.join(sorted(overlap))}", ln.EXIT_PRECOND)
+    rendered = {}
+    for variant in VARIANTS:
+        text = template.render(
+            staff=staff, vendors=static["vendors"], ts_ip4=static["ts_ip4"], ts_ip6=static["ts_ip6"],
+            tags=static["tags"], groups=static["groups"], ports=static["ports"],
+            breakglass=(variant == "breakglass"), window=window if variant == "breakglass" else None)
+        structural_check(variant, hujson_to_json(text), static)
+        rendered[variant] = text
+    return rendered
+
+
+def structural_check(variant: str, policy: object, static: dict) -> None:
+    """Refuse renders that open more than the design allows (defence against template edits)."""
+    if not isinstance(policy, dict):
+        raise ln.ToolError(f"{variant}: policy is not an object")
+    if policy.get("acls"):
+        raise ln.ToolError(f"{variant}: legacy 'acls' are not allowed, use grants")
+    if policy.get("ssh"):
+        raise ln.ToolError(f"{variant}: Tailscale SSH rules are not allowed")
+    if "tests" in policy:
+        raise ln.ToolError(f"{variant}: a 'tests' block must not reach production (see template header)")
+    vendor_group = static["groups"]["vendor"]
+    for grant in policy.get("grants", []):
+        srcs = grant.get("src", [])
+        dsts = grant.get("dst", [])
+        if "*" in srcs or "*" in dsts or "autogroup:member" in srcs:
+            raise ln.ToolError(f"{variant}: wildcard grant {grant}")
+        if static["tags"]["server"] in srcs:
+            raise ln.ToolError(f"{variant}: tag:server must never be a source")
+        if vendor_group in srcs and variant == "normal":
+            raise ln.ToolError(f"{variant}: vendor grant outside a break-glass window")
+
+
+def write_rendered(rendered: dict, out_dir: str) -> dict:
+    """Write the variants; unchanged files are left alone (auditd watches /etc/legatto)."""
+    paths = {}
+    for variant, text in rendered.items():
+        path = os.path.join(out_dir, f"{variant}.hujson")
+        data = text.encode("utf-8")
+        try:
+            with open(path, "rb") as fh:
+                unchanged = fh.read() == data
+        except FileNotFoundError:
+            unchanged = False
+        if not unchanged:
+            ln.atomic_write(path, data, 0o640, None)
+        paths[variant] = path
+    return paths
+
+
+# --- headscale ------------------------------------------------------------------------------
+
+def headscale_check(path: str) -> None:
+    proc = ln.run(["headscale", "policy", "check", "--file", path], check=False, timeout=30)
+    if proc.returncode != 0:
+        detail = (proc.stderr or proc.stdout).strip()
+        raise ln.ToolError(f"headscale policy check rejected {os.path.basename(path)}: {detail}", EXIT_CHECK)
+
+
+def reload_headscale() -> None:
+    ln.run(["systemctl", "reload", ln.HEADSCALE_UNIT], timeout=30)
+
+
+def install_policy(text: str) -> bool:
+    """Atomically replace /etc/headscale/policy.hujson; return True when it changed."""
+    try:
+        with open(ln.HEADSCALE_POLICY, encoding="utf-8") as fh:
+            if fh.read() == text:
+                return False
+    except FileNotFoundError:
+        pass
+    ln.atomic_write(ln.HEADSCALE_POLICY, text.encode("utf-8"), 0o640, HEADSCALE_GROUP)
+    return True
+
+
+# --- assert (server PacketFilter) --------------------------------------------------------------
+
+def _prefix(text: str) -> list:
+    """Expand a FilterRule IP spec into networks ('*' -> both families)."""
+    text = text.strip()
+    if text == "*":
+        return [ipaddress.ip_network("0.0.0.0/0"), ipaddress.ip_network("::/0")]
+    if "-" in text and "/" not in text:
+        first, last = (ipaddress.ip_address(p) for p in text.split("-", 1))
+        return list(ipaddress.summarize_address_range(first, last))
+    return [ipaddress.ip_network(text, strict=False)]
+
+
+def filter_rules(netmap: dict) -> list:
+    """Normalise the server netmap filter into [(src_nets, dst_net, first, last)]."""
+    rules = []
+    for rule in netmap.get("PacketFilterRules") or []:
+        srcs = [net for spec in rule.get("SrcIPs") or [] for net in _prefix(spec)]
+        for dst in rule.get("DstPorts") or []:
+            ports = dst.get("Ports") or {}
+            for net in _prefix(dst.get("IP", "")):
+                rules.append((srcs, net, int(ports.get("First", 0)), int(ports.get("Last", 65535))))
+    if rules or "PacketFilterRules" in netmap:
+        return rules
+    for match in netmap.get("PacketFilter") or []:
+        srcs = [net for spec in match.get("Srcs") or [] for net in _prefix(spec)]
+        for dst in match.get("Dsts") or []:
+            ports = dst.get("Ports") or {}
+            for net in _prefix(dst.get("Net", "")):
+                rules.append((srcs, net, int(ports.get("First", 0)), int(ports.get("Last", 65535))))
+    return rules
+
+
+def server_netmap() -> dict:
+    proc = ln.run(["tailscale", "debug", "netmap"], timeout=20)
+    try:
+        doc = json.loads(proc.stdout)
+    except ValueError as exc:
+        raise ln.ToolError("tailscale debug netmap: unparsable JSON") from exc
+    if not isinstance(doc, dict):
+        raise ln.ToolError("tailscale debug netmap: unexpected document")
+    return doc
+
+
+def classify_nodes(nodes: list, staff: list, vendors: list) -> dict:
+    """Map ip -> class: server, office, staff, vendor, other."""
+    classes = {}
+    for node in nodes:
+        if ln.TAG_SERVER in node["tags"]:
+            cls = "server"
+        elif ln.TAG_OFFICE in node["tags"]:
+            cls = "office"
+        elif node["tags"]:
+            cls = "other"
+        elif node["user"] in vendors:
+            cls = "vendor"
+        elif node["user"] in staff:
+            cls = "staff"
+        else:
+            cls = "other"
+        for ip in node["ips"]:
+            classes[ipaddress.ip_address(ip)] = cls
+    return classes
+
+
+def evaluate(rules: list, classes: dict, static: dict, expect: str) -> list:
+    ts4 = ipaddress.ip_address(static["ts_ip4"])
+    ts6 = ipaddress.ip_address(static["ts_ip6"])
+    ssh, https = static["ports"]["ssh"], static["ports"]["https"]
+    services = [("ssh", ts4, ssh), ("crm", ts4, https), ("admin", ts6, https)]
+    allowed = {
+        "ssh": {"vendor"} if expect == "breakglass" else set(),
+        "crm": {"staff", "office"},
+        "admin": {"office", "vendor"} if expect == "breakglass" else {"office"},
+    }
+    problems = []
+    vendor_reach: dict = {"ssh": set(), "admin": set()}
+
+    def inside(addr: object, net: object) -> bool:
+        return addr.version == net.version and addr in net
+
+    for srcs, dst, first, last in rules:
+        covers_server = inside(ts4, dst) or inside(ts6, dst)
+        if not covers_server:
+            continue
+        matched = [name for name, addr, port in services if inside(addr, dst) and first <= port <= last]
+        span_ok = (first == last) and matched
+        if not span_ok:
+            problems.append(f"rule opens {dst} ports {first}-{last} on the server")
+            continue
+        for net in srcs:
+            # Headscale aggregates node addresses into prefixes (e.g. /31); a
+            # wide prefix would admit nodes that do not exist yet.
+            if net.num_addresses > MAX_SOURCE_ADDRESSES:
+                problems.append(f"rule source {net} is wider than /{net.max_prefixlen - 8}")
+                continue
+            for ip, cls in classes.items():
+                if not inside(ip, net):
+                    continue
+                for name in matched:
+                    if cls not in allowed[name]:
+                        problems.append(f"{cls} {ip} may reach {name} ({dst} port {first}) in variant {expect}")
+                    elif cls == "vendor" and name in vendor_reach:
+                        vendor_reach[name].add(ip)
+    if expect == "breakglass":
+        vendor_v4 = {ip for ip, cls in classes.items() if cls == "vendor" and ip.version == 4}
+        vendor_v6 = {ip for ip, cls in classes.items() if cls == "vendor" and ip.version == 6}
+        missing_ssh = vendor_v4 - vendor_reach["ssh"]
+        # admin is the server's IPv6; Headscale may list the vendor sources by
+        # either family, but every vendor node must be present in one of them.
+        admin_ok = vendor_v6 <= vendor_reach["admin"] or vendor_v4 <= vendor_reach["admin"]
+        if missing_ssh:
+            problems.append(f"vendor nodes without ssh in breakglass: {sorted(map(str, missing_ssh))}")
+        if not admin_ok:
+            problems.append("vendor nodes without admin in breakglass")
+    return problems
+
+
+def assert_policy(expect: str, timeout: float, static: dict, staff: list) -> dict:
+    deadline = time.monotonic() + timeout
+    problems: list = []
+    attempts = 0
+    while True:
+        attempts += 1
+        try:
+            nodes = ln.headscale_nodes()
+            classes = classify_nodes(nodes, staff, static["vendors"])
+            problems = evaluate(filter_rules(server_netmap()), classes, static, expect)
+        except ln.ToolError as exc:
+            problems = [str(exc)]
+        if not problems:
+            return {"expect": expect, "ok": True, "attempts": attempts}
+        if time.monotonic() >= deadline:
+            break
+        time.sleep(2)
+    raise ln.ToolError(f"PacketFilter does not match variant {expect}: {'; '.join(problems[:5])}", EXIT_ASSERT)
+
+
+# --- commands ---------------------------------------------------------------------------------
+
+def cmd_render(args: argparse.Namespace) -> dict:
+    static = load_static(args.static)
+    staff = load_staff(args.staff)
+    rendered = render_variants(args.template, static, staff, load_window(args.state))
+    out_dir = args.out or ln.POLICY_DIR
+    paths = write_rendered(rendered, out_dir)
+    return {"paths": paths, "staff": len(staff), "vendors": len(static["vendors"])}
+
+
+def cmd_check(args: argparse.Namespace) -> dict:
+    static = load_static(args.static)
+    staff = load_staff(args.staff)
+    rendered = render_variants(args.template, static, staff, load_window(args.state))
+    with tempfile.TemporaryDirectory(prefix="legatto-policy-") as tmp:
+        for variant, path in write_rendered(rendered, tmp).items():
+            headscale_check(path)
+    return {"checked": list(VARIANTS)}
+
+
+def apply_policy(args: argparse.Namespace) -> dict:
+    static = load_static(args.static)
+    staff = load_staff(args.staff)
+    window = load_window(args.state)
+    rendered = render_variants(args.template, static, staff, window)
+    variant = "breakglass" if window else "normal"
+    with tempfile.TemporaryDirectory(prefix="legatto-policy-") as tmp:
+        paths = write_rendered(rendered, tmp)
+        # Opening a window also checks the normal variant, so that closing the
+        # window can never be blocked later; closing checks only normal.
+        for name in ([variant, "normal"] if variant == "breakglass" else ["normal"]):
+            headscale_check(paths[name])
+    write_rendered(rendered, ln.POLICY_DIR)
+    changed = install_policy(rendered[variant])
+    if changed:
+        reload_headscale()
+    result = {"variant": variant, "changed": changed, "asserted": False}
+    if not args.no_assert:
+        assert_policy(variant, args.timeout, static, staff)
+        result["asserted"] = True
+    return result
+
+
+def cmd_apply(args: argparse.Namespace) -> dict:
+    ln.require_root()
+    ln.parse_actor(args.actor, required=False)
+    with ln.FileLock(LOCK):
+        return apply_policy(args)
+
+
+def cmd_assert(args: argparse.Namespace) -> dict:
+    ln.require_root()
+    static = load_static(args.static)
+    staff = load_staff(args.staff)
+    expect = args.expect or active_variant(args.state)
+    return assert_policy(expect, args.timeout, static, staff)
+
+
+def build_parser() -> argparse.ArgumentParser:
+    parser = argparse.ArgumentParser(prog="legatto-policy", description="Headscale policy of the office")
+    sub = parser.add_subparsers(dest="cmd", required=True)
+    for name in ("render", "check", "apply", "assert"):
+        p = sub.add_parser(name)
+        p.add_argument("--json", action="store_true")
+        p.add_argument("--template", default=TEMPLATE)
+        p.add_argument("--static", default=STATIC)
+        p.add_argument("--staff", default=STAFF)
+        p.add_argument("--state", default=STATE)
+        if name == "render":
+            p.add_argument("--out", default=None, help="directory for {normal,breakglass}.hujson")
+        if name == "apply":
+            p.add_argument("--actor", default=None)
+            p.add_argument("--no-assert", action="store_true")
+        if name in ("apply", "assert"):
+            p.add_argument("--timeout", type=float, default=60.0)
+        if name == "assert":
+            p.add_argument("--expect", choices=VARIANTS, default=None)
+    return parser
+
+
+def main(argv: list) -> int:
+    parser = build_parser()
+    try:
+        args = parser.parse_args(argv)
+    except SystemExit as exc:
+        return ln.EXIT_ARGS if exc.code else ln.EXIT_OK
+    handlers = {"render": cmd_render, "check": cmd_check, "apply": cmd_apply, "assert": cmd_assert}
+    try:
+        result = handlers[args.cmd](args)
+    except ln.ToolError as exc:
+        ln.warn(str(exc))
+        return exc.code
+    except OSError as exc:
+        ln.warn(str(exc))
+        return ln.EXIT_ERR
+    if args.json:
+        print(json.dumps(result, sort_keys=True))
+    else:
+        print(json.dumps(result, sort_keys=True), file=sys.stderr)
+    return ln.EXIT_OK
+
+
+if __name__ == "__main__":
+    sys.exit(main(sys.argv[1:]))

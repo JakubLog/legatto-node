@@ -1,0 +1,397 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "$id": "https://updates.legatto.pl/schema/manifest.schema.json",
+  "title": "Legatto release manifest (legatto-release/1)",
+  "description": "Signed description of one release bundle. Published as releases/<version>/manifest.json next to the artifacts; signatures are manifest.json.<signer-id>.sig produced by `ssh-keygen -Y sign -n legatto-release`. The server trusts nothing in the bundle that is not listed here with its sha256. Time fields are informational: channel delays are enforced from local first-seen (policy.schema.json).",
+  "type": "object",
+  "additionalProperties": false,
+  "required": [
+    "schema",
+    "product",
+    "version",
+    "sequence",
+    "type",
+    "channels",
+    "released_at",
+    "expires",
+    "min_installed",
+    "min_contract_version",
+    "changelog_url",
+    "advisories",
+    "source",
+    "artifacts",
+    "images",
+    "migrations",
+    "rollback",
+    "egress",
+    "sbom",
+    "healthchecks"
+  ],
+  "properties": {
+    "schema": { "const": "legatto-release/1" },
+    "product": { "const": "legatto" },
+    "version": { "$ref": "#/$defs/semver" },
+    "sequence": {
+      "description": "Strictly increasing across all releases. The server rejects sequence <= last installed sequence (anti-rollback) unless the office admin requested `legatto-update rollback`.",
+      "type": "integer",
+      "minimum": 1
+    },
+    "type": { "enum": ["security", "feature"] },
+    "channels": {
+      "description": "Channels this release is intended for. Always starts with canary; early/stable additionally need a signed promotion document.",
+      "type": "array",
+      "items": { "$ref": "#/$defs/channel" },
+      "minItems": 1,
+      "uniqueItems": true,
+      "contains": { "const": "canary" }
+    },
+    "released_at": { "$ref": "#/$defs/timestamp" },
+    "expires": {
+      "description": "After this instant the server refuses to start installing this manifest.",
+      "$ref": "#/$defs/timestamp"
+    },
+    "min_installed": {
+      "description": "Lowest installed version that may upgrade directly to this release (0.0.0 for the first release).",
+      "$ref": "#/$defs/semver"
+    },
+    "min_contract_version": {
+      "description": "Lowest LEGATTO_CONTRACT_VERSION in /etc/legatto/office.env. A lower host baseline means the release needs a break-glass Ansible run first (status upd=blocked-baseline).",
+      "type": "integer",
+      "minimum": 1
+    },
+    "changelog_url": { "$ref": "#/$defs/https_url" },
+    "advisories": {
+      "type": "array",
+      "items": {
+        "type": "object",
+        "additionalProperties": false,
+        "required": ["id", "severity", "summary"],
+        "properties": {
+          "id": { "type": "string", "pattern": "^[A-Za-z0-9][A-Za-z0-9._:-]{1,63}$" },
+          "severity": { "enum": ["low", "medium", "high", "critical"] },
+          "summary": { "type": "string", "minLength": 1, "maxLength": 500 },
+          "url": { "$ref": "#/$defs/https_url" }
+        }
+      }
+    },
+    "source": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": ["infra", "app"],
+      "properties": {
+        "infra": { "$ref": "#/$defs/git_source" },
+        "app": {
+          "description": "legatto-app release pinned by hash in a signed legatto-infra commit (R6).",
+          "type": "object",
+          "additionalProperties": false,
+          "required": ["repo", "commit", "version", "release_sha256"],
+          "properties": {
+            "repo": { "$ref": "#/$defs/repo" },
+            "commit": { "$ref": "#/$defs/git_commit" },
+            "version": { "$ref": "#/$defs/semver" },
+            "release_sha256": { "$ref": "#/$defs/sha256" },
+            "ci_run": { "$ref": "#/$defs/https_url" }
+          }
+        },
+        "supabase_selfhosted": {
+          "type": "string",
+          "pattern": "^(0|[1-9][0-9]*)\\.(0|[1-9][0-9]*)\\.(0|[1-9][0-9]*)$"
+        }
+      }
+    },
+    "artifacts": {
+      "description": "Every file of the bundle except manifest.json and its signatures.",
+      "type": "array",
+      "minItems": 1,
+      "items": { "$ref": "#/$defs/artifact" }
+    },
+    "images": {
+      "description": "Every container image the compose project may run, by digest. artifact=null: the image is not shipped in this bundle and must already be loaded locally with exactly this digest.",
+      "type": "array",
+      "minItems": 1,
+      "items": {
+        "type": "object",
+        "additionalProperties": false,
+        "required": ["name", "ref", "digest", "platform", "artifact"],
+        "properties": {
+          "name": { "type": "string", "pattern": "^[a-z][a-z0-9-]{0,40}$" },
+          "ref": {
+            "description": "Human-readable reference (registry/repository:tag). Never used for pulling; servers do not pull.",
+            "type": "string",
+            "pattern": "^[a-z0-9.-]+(:[0-9]+)?/[a-z0-9._/-]+:[A-Za-z0-9._-]{1,128}$"
+          },
+          "digest": { "$ref": "#/$defs/digest" },
+          "platform": { "const": "linux/amd64" },
+          "artifact": {
+            "oneOf": [{ "$ref": "#/$defs/artifact_name" }, { "type": "null" }]
+          }
+        }
+      }
+    },
+    "migrations": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": ["from", "to", "count", "files", "n_minus_1_compatible"],
+      "properties": {
+        "from": { "oneOf": [{ "$ref": "#/$defs/migration_id" }, { "type": "null" }] },
+        "to": { "$ref": "#/$defs/migration_id" },
+        "count": { "type": "integer", "minimum": 0 },
+        "files": {
+          "description": "Migrations new in this release (applied in name order, one transaction per file).",
+          "type": "array",
+          "items": {
+            "type": "object",
+            "additionalProperties": false,
+            "required": ["name", "sha256"],
+            "properties": {
+              "name": { "type": "string", "pattern": "^[0-9]{14}_[a-z0-9_]{1,100}\\.sql$" },
+              "sha256": { "$ref": "#/$defs/sha256" }
+            }
+          }
+        },
+        "n_minus_1_compatible": {
+          "description": "Expand/contract rule: the previous release's code runs on the new schema. Releases without it are never published.",
+          "const": true
+        }
+      }
+    },
+    "rollback": {
+      "description": "Auto-rollback restores images, config and binaries; never the database.",
+      "const": "images-only"
+    },
+    "egress": {
+      "description": "Egress allowlist as data. The server computes the difference to the effective allowlist; any addition holds the whole release for office-admin approval regardless of `type`.",
+      "type": "object",
+      "additionalProperties": false,
+      "required": ["version", "roles", "features"],
+      "properties": {
+        "version": { "const": 1 },
+        "roles": {
+          "description": "Always-on entries per role.",
+          "type": "object",
+          "propertyNames": { "$ref": "#/$defs/egress_role" },
+          "additionalProperties": { "$ref": "#/$defs/egress_entries" }
+        },
+        "features": {
+          "description": "Entries active only when the office admin enabled the feature.",
+          "type": "object",
+          "propertyNames": { "$ref": "#/$defs/feature" },
+          "additionalProperties": {
+            "type": "object",
+            "propertyNames": { "$ref": "#/$defs/egress_role" },
+            "additionalProperties": { "$ref": "#/$defs/egress_entries" }
+          }
+        }
+      }
+    },
+    "sbom": {
+      "description": "SBOM per shipped image and binary (CRA). Each entry points at an artifact of kind sbom.",
+      "type": "array",
+      "minItems": 1,
+      "items": {
+        "type": "object",
+        "additionalProperties": false,
+        "required": ["artifact", "format", "subject"],
+        "properties": {
+          "artifact": { "$ref": "#/$defs/artifact_name" },
+          "format": { "enum": ["cyclonedx-json", "spdx-json"] },
+          "subject": { "type": "string", "minLength": 1, "maxLength": 200 }
+        }
+      }
+    },
+    "healthchecks": {
+      "type": "array",
+      "minItems": 1,
+      "uniqueItems": true,
+      "items": {
+        "type": "string",
+        "pattern": "^(compose:all-healthy|http:(crm|admin|internal):/[A-Za-z0-9._~/?=&-]{0,200}|sql:migration-level|egress:selftest|worker:selftest)$"
+      }
+    },
+    "crons": {
+      "description": "Scheduled HTTP jobs of the app (from vercel.json), rendered to legatto-cron-<name>.timer.",
+      "type": "array",
+      "items": {
+        "type": "object",
+        "additionalProperties": false,
+        "required": ["name", "path", "schedule"],
+        "properties": {
+          "name": { "type": "string", "pattern": "^[a-z0-9][a-z0-9-]{0,40}$" },
+          "path": { "type": "string", "pattern": "^/api/cron/[a-z0-9-]{1,60}$" },
+          "schedule": {
+            "description": "Five-field cron expression, UTC (Vercel semantics).",
+            "type": "string",
+            "pattern": "^[0-9*/,-]+ [0-9*/,-]+ [0-9*/,-]+ [0-9*/,-]+ [0-9*/,-]+$"
+          }
+        }
+      }
+    },
+    "functions": {
+      "type": "array",
+      "uniqueItems": true,
+      "items": { "type": "string", "pattern": "^[a-z0-9][a-z0-9-]{0,60}$" }
+    }
+  },
+  "allOf": [
+    {
+      "if": { "properties": { "type": { "const": "security" } } },
+      "then": { "properties": { "advisories": { "minItems": 1 } } }
+    }
+  ],
+  "$defs": {
+    "semver": {
+      "type": "string",
+      "pattern": "^(0|[1-9][0-9]*)\\.(0|[1-9][0-9]*)\\.(0|[1-9][0-9]*)(-(0|[1-9][0-9]*|[0-9]*[A-Za-z-][0-9A-Za-z-]*)(\\.(0|[1-9][0-9]*|[0-9]*[A-Za-z-][0-9A-Za-z-]*))*)?$"
+    },
+    "channel": { "enum": ["canary", "early", "stable"] },
+    "timestamp": {
+      "type": "string",
+      "format": "date-time",
+      "pattern": "^[0-9]{4}-[0-9]{2}-[0-9]{2}T[0-9]{2}:[0-9]{2}:[0-9]{2}Z$"
+    },
+    "sha256": { "type": "string", "pattern": "^[0-9a-f]{64}$" },
+    "digest": { "type": "string", "pattern": "^sha256:[0-9a-f]{64}$" },
+    "git_commit": { "type": "string", "pattern": "^[0-9a-f]{40}$" },
+    "repo": { "type": "string", "pattern": "^github\\.com/[A-Za-z0-9_.-]+/[A-Za-z0-9_.-]+$" },
+    "https_url": { "type": "string", "format": "uri", "pattern": "^https://[^\\s]+$", "maxLength": 500 },
+    "git_source": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": ["repo", "commit"],
+      "properties": {
+        "repo": { "$ref": "#/$defs/repo" },
+        "commit": { "$ref": "#/$defs/git_commit" },
+        "ci_run": { "$ref": "#/$defs/https_url" }
+      }
+    },
+    "migration_id": { "type": "string", "pattern": "^[0-9]{14}$" },
+    "artifact_name": {
+      "description": "Flat file name inside releases/<version>/ (no directories, no traversal).",
+      "type": "string",
+      "pattern": "^[a-z0-9][a-z0-9._-]{0,99}$"
+    },
+    "relative_path": {
+      "type": "string",
+      "pattern": "^(?!/)(?!.*(^|/)\\.\\.?(/|$))[A-Za-z0-9._@-]+(/[A-Za-z0-9._@-]+)*$",
+      "maxLength": 255
+    },
+    "egress_role": { "enum": ["host", "app", "auth", "functions", "intake", "publish"] },
+    "feature": { "enum": ["ai", "mcp", "email", "getresponse", "push", "ics", "hibp"] },
+    "egress_entries": {
+      "type": "array",
+      "uniqueItems": true,
+      "items": {
+        "type": "object",
+        "additionalProperties": false,
+        "required": ["host", "port", "purpose"],
+        "properties": {
+          "host": {
+            "description": "Exact lowercase host name, or one leading `*.` label wildcard (checked against the Public Suffix List by the proxy). No IP literals.",
+            "type": "string",
+            "pattern": "^(\\*\\.)?([a-z0-9]([a-z0-9-]{0,61}[a-z0-9])?\\.)+[a-z]{2,63}$",
+            "maxLength": 253
+          },
+          "port": { "enum": [80, 443] },
+          "purpose": { "type": "string", "minLength": 1, "maxLength": 200 }
+        }
+      }
+    },
+    "artifact": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": ["name", "kind", "size", "sha256"],
+      "properties": {
+        "name": { "$ref": "#/$defs/artifact_name" },
+        "kind": {
+          "enum": [
+            "oci-archive",
+            "edge-functions",
+            "config",
+            "sql-migrations",
+            "binary",
+            "deb",
+            "worker-bundle",
+            "sbom",
+            "notes"
+          ]
+        },
+        "size": { "type": "integer", "minimum": 1, "maximum": 4294967296 },
+        "sha256": { "$ref": "#/$defs/sha256" },
+        "files": {
+          "description": "kind=config: every file in the archive with its applier. Targets are fixed per applier on the server; paths here are relative to the archive.",
+          "type": "array",
+          "minItems": 1,
+          "items": {
+            "type": "object",
+            "additionalProperties": false,
+            "required": ["path", "sha256", "applier"],
+            "properties": {
+              "path": { "$ref": "#/$defs/relative_path" },
+              "sha256": { "$ref": "#/$defs/sha256" },
+              "applier": { "enum": ["compose", "caddy-site", "systemd-unit", "egress", "env-template"] }
+            }
+          }
+        },
+        "binaries": {
+          "type": "array",
+          "minItems": 1,
+          "items": {
+            "type": "object",
+            "additionalProperties": false,
+            "required": ["name", "version", "sha256"],
+            "properties": {
+              "name": { "enum": ["caddy", "lego", "smokescreen"] },
+              "version": { "$ref": "#/$defs/semver" },
+              "sha256": { "$ref": "#/$defs/sha256" }
+            }
+          }
+        },
+        "packages": {
+          "type": "array",
+          "minItems": 1,
+          "items": {
+            "type": "object",
+            "additionalProperties": false,
+            "required": ["name", "version", "sha256"],
+            "properties": {
+              "name": { "enum": ["headscale", "tailscale"] },
+              "version": { "type": "string", "pattern": "^[0-9][0-9A-Za-z.+~-]{0,63}$" },
+              "sha256": { "$ref": "#/$defs/sha256" }
+            }
+          }
+        },
+        "worker": {
+          "type": "object",
+          "additionalProperties": false,
+          "required": ["script_name", "entry_sha256"],
+          "properties": {
+            "script_name": { "type": "string", "pattern": "^[a-z0-9][a-z0-9-]{0,62}$" },
+            "entry_sha256": { "$ref": "#/$defs/sha256" }
+          }
+        }
+      },
+      "allOf": [
+        {
+          "if": { "properties": { "kind": { "const": "config" } } },
+          "then": { "required": ["files"] },
+          "else": { "not": { "required": ["files"] } }
+        },
+        {
+          "if": { "properties": { "kind": { "const": "binary" } } },
+          "then": { "required": ["binaries"] },
+          "else": { "not": { "required": ["binaries"] } }
+        },
+        {
+          "if": { "properties": { "kind": { "const": "deb" } } },
+          "then": { "required": ["packages"] },
+          "else": { "not": { "required": ["packages"] } }
+        },
+        {
+          "if": { "properties": { "kind": { "const": "worker-bundle" } } },
+          "then": { "required": ["worker"] },
+          "else": { "not": { "required": ["worker"] } }
+        }
+      ]
+    }
+  }
+}

@@ -1,0 +1,526 @@
+#!/usr/bin/python3
+"""legatto-stack — run the Legatto docker compose project (lane platform, role app).
+
+The systemd units shipped in the release bundle (legatto-stack.service,
+legatto-secrets-render.service, legatto-cron@.service) may only execute tools
+installed by Ansible from /opt/legatto/sbin; this is that tool.
+
+Subcommands:
+  up [--compose-dir D]            seed the Vault key, `docker compose up -d --remove-orphans --wait`
+  refresh                         `up` if legatto-stack.service is active and no update runs
+                                  (after env files were re-rendered, e.g. feature flags changed)
+  down                            `docker compose down` (volumes stay)
+  start SERVICE...                start optional services (meta, studio: profile admin)
+  stop SERVICE...                 stop and remove the containers of SERVICE (maintenance, studio)
+  status [--json]                 state and health of every expected service
+  check --compose-dir D --templates T
+                                  render T into a private temp dir, `docker compose config -q`
+  migrate --compose-dir D --templates T [--check]
+                                  start db if needed, `docker compose run --rm migrator migrate|check`
+  cron NAME                       GET http://<app>:3000/api/cron/NAME with the cron secret
+                                  (legatto-cron@NAME.service, DynamicUser, LoadCredential=cron_secret)
+  probe --internal PATH | --surface crm|admin PATH
+                                  release health checks: app internal listener, or HTTPS through Caddy
+
+Exit codes: 0 ok, 1 unexpected error, 2 bad arguments, 3 lock busy, 4 precondition,
+10 migrator check rejected, 13 migration failed, 42 compose validation failed,
+43 unhealthy / probe failed, 44 cron job answered non-2xx.
+"""
+
+import argparse
+import fcntl
+import http.client
+import json
+import os
+import re
+import shutil
+import socket
+import ssl
+import subprocess
+import sys
+import tempfile
+import time
+
+# contract: legatto_compose_project
+PROJECT = "legatto"
+# contract: legatto_paths.compose_current
+COMPOSE_DIR = "/opt/legatto/current/compose"
+# contract: legatto_paths.run_env
+RUN_ENV_DIR = "/run/legatto/env"
+# contract: legatto_paths.run
+RUN_DIR = "/run/legatto"
+# contract: legatto_paths.pii_key
+PII_KEY = "/run/legatto/keys/pii_field_key"
+# contract: legatto_paths.secrets
+SECRETS_DIR = "/etc/legatto/secrets"
+# contract: legatto_paths.office_env
+OFFICE_ENV = "/etc/legatto/office.env"
+# contract: legatto_paths.studio_state
+STUDIO_STATE = "/var/lib/legatto/studio.json"
+# contract: legatto_paths.sbin
+SBIN = "/opt/legatto/sbin"
+# contract: legatto_ip_host_net.app + legatto_ports.local.app_http
+APP_HTTP = ("172.30.0.10", 3000)
+# contract: legatto_compose_services
+SERVICES = ("db", "auth", "rest", "realtime", "storage", "functions", "api-gw", "app", "meta", "studio",
+            "egress-app", "egress-auth", "egress-fn", "egress-intake", "egress-publish")
+# contract: legatto_compose_profile_admin
+PROFILE_ADMIN = "admin"
+ADMIN_SERVICES = ("meta", "studio")
+PROFILE_TOOLS = "tools"
+# contract: legatto_units.stack
+STACK_UNIT = "legatto-stack.service"
+UPDATE_LOCK = RUN_DIR + "/update.lock"
+STACK_LOCK = RUN_DIR + "/stack.lock"
+TMP_PARENT = RUN_DIR + "/stack-tmp"
+UPSTREAM_FILE = "supabase/docker-compose.yml"
+OVERRIDE_FILE = "docker-compose.legatto.yml"
+PGSODIUM_KEY = "pgsodium_root.key"
+DB_CONFIG_VOLUME = PROJECT + "_db-config"
+WAIT_TIMEOUT = 600
+CRON_TIMEOUT = 130
+NAME_RE = re.compile(r"^[a-z0-9][a-z0-9-]{0,40}$")
+PATH_RE = re.compile(r"^/[A-Za-z0-9._~/?=&-]{0,200}$")
+
+
+class Fail(Exception):
+    def __init__(self, code, message):
+        super().__init__(message)
+        self.code = code
+
+
+def log(msg):
+    print("legatto-stack: " + msg, file=sys.stderr, flush=True)
+
+
+def require_root():
+    if os.geteuid() != 0:
+        raise Fail(4, "must run as root")
+
+
+def take_lock(path, wait_seconds=10):
+    os.makedirs(os.path.dirname(path), exist_ok=True)
+    fd = os.open(path, os.O_RDWR | os.O_CREAT, 0o600)
+    deadline = time.monotonic() + wait_seconds
+    while True:
+        try:
+            fcntl.flock(fd, fcntl.LOCK_EX | fcntl.LOCK_NB)
+            return fd
+        except BlockingIOError:
+            if time.monotonic() > deadline:
+                os.close(fd)
+                raise Fail(3, "lock busy: " + path)
+            time.sleep(0.5)
+
+
+def lock_is_held(path):
+    try:
+        fd = os.open(path, os.O_RDONLY)
+    except FileNotFoundError:
+        return False
+    try:
+        fcntl.flock(fd, fcntl.LOCK_SH | fcntl.LOCK_NB)
+        return False
+    except BlockingIOError:
+        return True
+    finally:
+        os.close(fd)
+
+
+def parse_env_file(path):
+    values = {}
+    with open(path, "r", encoding="utf-8") as fh:
+        for raw in fh:
+            line = raw.rstrip("\n")
+            if line and not line.lstrip().startswith("#") and "=" in line:
+                key, _, value = line.partition("=")
+                values[key] = value
+    return values
+
+
+class Compose:
+    """docker compose invocation for one compose directory and one env directory."""
+
+    def __init__(self, compose_dir, env_dir=RUN_ENV_DIR, profiles=()):
+        self.compose_dir = compose_dir
+        self.env_dir = env_dir
+        self.profiles = list(profiles)
+        for rel in (UPSTREAM_FILE, OVERRIDE_FILE):
+            if not os.path.isfile(os.path.join(compose_dir, rel)):
+                raise Fail(4, "compose file missing: " + os.path.join(compose_dir, rel))
+        if not os.path.isfile(os.path.join(env_dir, "compose.env")):
+            raise Fail(4, "%s/compose.env missing (legatto-secrets render)" % env_dir)
+
+    def argv(self, *args):
+        cmd = ["docker", "compose", "-p", PROJECT,
+               "--project-directory", os.path.join(self.compose_dir, "supabase"),
+               "-f", os.path.join(self.compose_dir, UPSTREAM_FILE),
+               "-f", os.path.join(self.compose_dir, OVERRIDE_FILE),
+               "--env-file", os.path.join(self.env_dir, "compose.env")]
+        for profile in self.profiles:
+            cmd += ["--profile", profile]
+        return cmd + list(args)
+
+    def env(self):
+        # Interpolation must come from compose.env only: start from a minimal environment.
+        env = {k: v for k, v in os.environ.items() if k in ("PATH", "HOME", "DOCKER_HOST", "DOCKER_CONTEXT",
+                                                             "DOCKER_CONFIG")}
+        env.setdefault("PATH", "/usr/sbin:/usr/bin:/sbin:/bin")
+        # env_file entries are ${LEGATTO_RUN_ENV_DIR:-/run/legatto/env}/<name>.env: validation
+        # and migrations point them at a private render of the new release's templates.
+        env["LEGATTO_RUN_ENV_DIR"] = self.env_dir
+        return env
+
+    def run(self, *args, capture=False, check=True):
+        proc = subprocess.run(self.argv(*args), env=self.env(), text=True,
+                              stdout=subprocess.PIPE if capture else None,
+                              stderr=subprocess.PIPE if capture else None)
+        if check and proc.returncode != 0:
+            detail = (proc.stderr or "").strip().splitlines()[-1:] if capture else []
+            raise Fail(1, "docker compose %s failed (%d) %s" % (args[0], proc.returncode, " ".join(detail)))
+        return proc
+
+    def config_json(self):
+        return json.loads(self.run("config", "--format", "json", capture=True).stdout)
+
+
+def studio_enabled():
+    try:
+        with open(STUDIO_STATE, "r", encoding="utf-8") as fh:
+            state = json.load(fh)
+    except (FileNotFoundError, json.JSONDecodeError):
+        return False
+    expires = state.get("expires_at")
+    if not state.get("enabled") or not expires:
+        return False
+    return time.strftime("%Y-%m-%dT%H:%M:%SZ", time.gmtime()) < expires
+
+
+def docker(*args, capture=True, check=True):
+    proc = subprocess.run(["docker"] + list(args), text=True,
+                          stdout=subprocess.PIPE if capture else None,
+                          stderr=subprocess.PIPE if capture else None)
+    if check and proc.returncode != 0:
+        raise Fail(1, "docker %s failed: %s" % (args[0], (proc.stderr or "").strip()[-300:]))
+    return proc
+
+
+def seed_pgsodium(compose):
+    """Put /etc/legatto/secrets/pgsodium_root.key into the db-config volume before the first db start.
+
+    The supabase/postgres image generates a random Vault root key on first start when the
+    file is absent; we provide ours (backed up in the recovery pack) instead. A different
+    key already in the volume means Vault data would be undecryptable: refuse to start.
+    """
+    src = os.path.join(SECRETS_DIR, PGSODIUM_KEY)
+    if not os.path.isfile(src):
+        raise Fail(4, src + " missing (legatto-secrets init)")
+    image = compose.config_json()["services"]["db"]["image"]
+    if docker("volume", "inspect", DB_CONFIG_VOLUME, check=False).returncode != 0:
+        # Let compose create the volume (with its labels) together with the db container.
+        compose.run("up", "--no-start", "db")
+    script = (
+        'k=/etc/postgresql-custom/pgsodium_root.key; '
+        'if [ -e "$k" ]; then cmp -s /run/seed "$k" && exit 0; exit 10; fi; '
+        'install -o postgres -g postgres -m 0600 /run/seed "$k"'
+    )
+    proc = docker("run", "--rm", "--pull", "never", "--network", "none", "--user", "0:0",
+                  "--entrypoint", "/bin/sh",
+                  "-v", DB_CONFIG_VOLUME + ":/etc/postgresql-custom",
+                  "-v", src + ":/run/seed:ro", image, "-c", script, check=False)
+    if proc.returncode == 10:
+        raise Fail(4, "pgsodium root key in volume %s differs from %s; refusing to start db"
+                   % (DB_CONFIG_VOLUME, src))
+    if proc.returncode != 0:
+        raise Fail(1, "seeding the pgsodium root key failed: " + (proc.stderr or "").strip()[-300:])
+
+
+def stack_up(compose_dir):
+    if not os.path.isfile(PII_KEY):
+        raise Fail(4, PII_KEY + " missing (legatto-secrets render)")
+    profiles = [PROFILE_ADMIN] if studio_enabled() else []
+    compose = Compose(compose_dir, profiles=profiles)
+    seed_pgsodium(compose)
+    proc = compose.run("up", "--detach", "--remove-orphans", "--wait", "--wait-timeout", str(WAIT_TIMEOUT),
+                       check=False)
+    if proc.returncode != 0:
+        raise Fail(43, "docker compose up did not reach a healthy state")
+    log("stack up (%s)" % compose_dir)
+    return 0
+
+
+def cmd_up(args):
+    require_root()
+    fd = take_lock(STACK_LOCK, wait_seconds=WAIT_TIMEOUT)
+    try:
+        return stack_up(args.compose_dir)
+    finally:
+        os.close(fd)
+
+
+def cmd_refresh(args):
+    require_root()
+    active = subprocess.run(["systemctl", "is-active", "--quiet", STACK_UNIT]).returncode == 0
+    if not active:
+        log("%s not active; nothing to refresh" % STACK_UNIT)
+        return 0
+    if lock_is_held(UPDATE_LOCK):
+        log("an update is running; it applies the new env files itself")
+        return 0
+    return cmd_up(args)
+
+
+def cmd_down(args):
+    require_root()
+    fd = take_lock(STACK_LOCK)
+    try:
+        Compose(args.compose_dir, profiles=[PROFILE_ADMIN]).run("down", "--remove-orphans")
+        return 0
+    finally:
+        os.close(fd)
+
+
+def check_service_names(names, allowed):
+    bad = [n for n in names if n not in allowed]
+    if bad:
+        raise Fail(2, "unknown service(s): " + ", ".join(bad))
+
+
+def cmd_start(args):
+    require_root()
+    check_service_names(args.services, ADMIN_SERVICES)
+    fd = take_lock(STACK_LOCK)
+    try:
+        compose = Compose(args.compose_dir, profiles=[PROFILE_ADMIN])
+        proc = compose.run("up", "--detach", "--wait", "--wait-timeout", "300", *args.services, check=False)
+        if proc.returncode != 0:
+            raise Fail(43, "services did not become healthy: " + ", ".join(args.services))
+        return 0
+    finally:
+        os.close(fd)
+
+
+def cmd_stop(args):
+    require_root()
+    check_service_names(args.services, SERVICES)
+    fd = take_lock(STACK_LOCK)
+    try:
+        compose = Compose(args.compose_dir, profiles=[PROFILE_ADMIN])
+        compose.run("stop", *args.services)
+        compose.run("rm", "--force", "--stop", *args.services)
+        return 0
+    finally:
+        os.close(fd)
+
+
+def parse_ps(text):
+    text = text.strip()
+    if not text:
+        return []
+    if text.startswith("["):
+        return json.loads(text)
+    return [json.loads(line) for line in text.splitlines() if line.strip()]
+
+
+def collect_status(compose_dir):
+    profiles = [PROFILE_ADMIN] if studio_enabled() else []
+    compose = Compose(compose_dir, profiles=profiles)
+    expected = [s for s in compose.run("config", "--services", capture=True).stdout.split() if s]
+    rows = parse_ps(compose.run("ps", "--all", "--format", "json", capture=True).stdout)
+    services = {}
+    for row in rows:
+        services[row.get("Service")] = {"state": row.get("State", ""), "health": row.get("Health", "")}
+    missing = [s for s in expected if s not in services]
+    bad = [s for s in expected if s in services
+           and (services[s]["state"] != "running" or services[s]["health"] not in ("", "healthy"))]
+    return {"v": 1, "ok": not missing and not bad, "services": services, "missing": missing, "unhealthy": bad,
+            "ts": time.strftime("%Y-%m-%dT%H:%M:%SZ", time.gmtime())}
+
+
+def cmd_status(args):
+    require_root()
+    status = collect_status(args.compose_dir)
+    if args.json:
+        print(json.dumps(status, sort_keys=True))
+    else:
+        for name, info in sorted(status["services"].items()):
+            print("%-16s %-10s %s" % (name, info["state"], info["health"]))
+        for name in status["missing"]:
+            print("%-16s %-10s" % (name, "missing"))
+    return 0 if status["ok"] else 43
+
+
+class PrivateTmp:
+    """Private temp dir on tmpfs for rendered env files (secrets never touch the disk)."""
+
+    def __enter__(self):
+        os.makedirs(TMP_PARENT, mode=0o700, exist_ok=True)
+        os.chmod(TMP_PARENT, 0o700)
+        self.path = tempfile.mkdtemp(prefix="render-", dir=TMP_PARENT)
+        return self.path
+
+    def __exit__(self, *exc):
+        shutil.rmtree(self.path, ignore_errors=True)
+        return False
+
+
+def render_into(templates, out):
+    proc = subprocess.run([os.path.join(SBIN, "legatto-secrets"), "render", "--templates", templates,
+                           "--out", out, "--no-keys"], text=True)
+    if proc.returncode == 42:
+        raise Fail(42, "env templates in %s are invalid" % templates)
+    if proc.returncode != 0:
+        raise Fail(4 if proc.returncode == 4 else 1, "legatto-secrets render failed (%d)" % proc.returncode)
+
+
+def cmd_check(args):
+    require_root()
+    override = os.path.join(args.compose_dir, OVERRIDE_FILE)
+    with open(override, "r", encoding="utf-8") as fh:
+        if "@@LEGATTO_IMAGE" in fh.read():
+            raise Fail(42, override + " still has @@LEGATTO_IMAGE@@ placeholders")
+    with PrivateTmp() as tmp:
+        render_into(args.templates, tmp)
+        compose = Compose(args.compose_dir, env_dir=tmp, profiles=[PROFILE_ADMIN, PROFILE_TOOLS])
+        proc = compose.run("config", "--quiet", capture=True, check=False)
+        if proc.returncode != 0:
+            for line in proc.stderr.strip().splitlines()[-5:]:
+                log("compose: " + line)
+            raise Fail(42, "docker compose config rejected %s" % args.compose_dir)
+    log("compose configuration valid: " + args.compose_dir)
+    return 0
+
+
+def cmd_migrate(args):
+    require_root()
+    fd = take_lock(STACK_LOCK, wait_seconds=WAIT_TIMEOUT)
+    try:
+        with PrivateTmp() as tmp:
+            render_into(args.templates, tmp)
+            compose = Compose(args.compose_dir, env_dir=tmp, profiles=[PROFILE_TOOLS])
+            seed_pgsodium(compose)
+            # Migrations need the auth and storage schemas, which those services create.
+            proc = compose.run("up", "--detach", "--wait", "--wait-timeout", str(WAIT_TIMEOUT),
+                               "db", "auth", "storage", check=False)
+            if proc.returncode != 0:
+                raise Fail(13, "db, auth or storage did not become healthy")
+            action = "check" if args.check else "migrate"
+            proc = compose.run("run", "--rm", "--no-TTY", "migrator", action, check=False)
+            if proc.returncode == 0:
+                log("migrator %s: ok" % action)
+                return 0
+            if args.check:
+                raise Fail(10, "migrator check rejected the migrations (%d)" % proc.returncode)
+            raise Fail(13, "migrator migrate failed (%d)" % proc.returncode)
+    finally:
+        os.close(fd)
+
+
+def cmd_cron(args):
+    if not NAME_RE.match(args.name):
+        raise Fail(2, "invalid cron name")
+    creds = os.environ.get("CREDENTIALS_DIRECTORY")
+    if not creds:
+        raise Fail(4, "CREDENTIALS_DIRECTORY unset (run through legatto-cron@.service)")
+    with open(os.path.join(creds, "cron_secret"), "r", encoding="ascii") as fh:
+        token = fh.read().strip()
+    conn = http.client.HTTPConnection(APP_HTTP[0], APP_HTTP[1], timeout=CRON_TIMEOUT)
+    try:
+        conn.request("GET", "/api/cron/" + args.name,
+                     headers={"Authorization": "Bearer " + token, "User-Agent": "legatto-cron"})
+        status = conn.getresponse().status
+    except OSError as exc:
+        raise Fail(44, "cron %s: request failed: %s" % (args.name, exc.__class__.__name__))
+    finally:
+        conn.close()
+    log("cron %s: HTTP %d" % (args.name, status))
+    return 0 if 200 <= status < 300 else 44
+
+
+class PinnedHTTPSConnection(http.client.HTTPSConnection):
+    """HTTPS to a fixed IP with SNI/verification for the real host name (tailnet-only names)."""
+
+    def __init__(self, host, ip, **kwargs):
+        super().__init__(host, 443, **kwargs)
+        self._ip = ip
+
+    def connect(self):
+        sock = socket.create_connection((self._ip, 443), self.timeout)
+        self.sock = self._context.wrap_socket(sock, server_hostname=self.host)
+
+
+def cmd_probe(args):
+    if not PATH_RE.match(args.path):
+        raise Fail(2, "invalid path")
+    if args.internal:
+        require_root()
+        compose = Compose(args.compose_dir)
+        proc = compose.run("exec", "--no-TTY", "app", "/nodejs/bin/node", "/app/server/healthcheck.mjs", args.path,
+                           check=False, capture=True)
+        ok = proc.returncode == 0
+        log("probe internal %s: %s" % (args.path, "ok" if ok else "fail"))
+        return 0 if ok else 43
+    office = parse_env_file(OFFICE_ENV)
+    host, ip = {"crm": (office["LEGATTO_HOST_CRM"], office["LEGATTO_TS_IP4"]),
+                "admin": (office["LEGATTO_HOST_ADMIN"], office["LEGATTO_TS_IP6"])}[args.surface]
+    conn = PinnedHTTPSConnection(host, ip, timeout=30, context=ssl.create_default_context())
+    try:
+        conn.request("GET", args.path, headers={"User-Agent": "legatto-probe"})
+        status = conn.getresponse().status
+    except (OSError, ssl.SSLError) as exc:
+        log("probe %s %s: %s" % (args.surface, args.path, exc.__class__.__name__))
+        return 43
+    finally:
+        conn.close()
+    log("probe %s %s: HTTP %d" % (args.surface, args.path, status))
+    return 0 if 200 <= status < 300 else 43
+
+
+def main(argv=None):
+    parser = argparse.ArgumentParser(prog="legatto-stack", description=__doc__.split("\n")[0])
+    sub = parser.add_subparsers(dest="cmd", required=True)
+
+    def with_dir(p, required=False):
+        p.add_argument("--compose-dir", required=required, default=None if required else COMPOSE_DIR)
+        return p
+
+    with_dir(sub.add_parser("up"))
+    with_dir(sub.add_parser("refresh"))
+    with_dir(sub.add_parser("down"))
+    p = with_dir(sub.add_parser("start"))
+    p.add_argument("services", nargs="+")
+    p = with_dir(sub.add_parser("stop"))
+    p.add_argument("services", nargs="+")
+    p = with_dir(sub.add_parser("status"))
+    p.add_argument("--json", action="store_true")
+    p = with_dir(sub.add_parser("check"), required=True)
+    p.add_argument("--templates", required=True)
+    p = with_dir(sub.add_parser("migrate"), required=True)
+    p.add_argument("--templates", required=True)
+    p.add_argument("--check", action="store_true")
+    p = sub.add_parser("cron")
+    p.add_argument("name")
+    p = with_dir(sub.add_parser("probe"))
+    target = p.add_mutually_exclusive_group(required=True)
+    target.add_argument("--internal", action="store_true")
+    target.add_argument("--surface", choices=("crm", "admin"))
+    p.add_argument("path")
+    try:
+        args = parser.parse_args(argv)
+    except SystemExit as exc:
+        return 2 if exc.code else 0
+    handlers = {"up": cmd_up, "refresh": cmd_refresh, "down": cmd_down, "start": cmd_start, "stop": cmd_stop,
+                "status": cmd_status, "check": cmd_check, "migrate": cmd_migrate, "cron": cmd_cron,
+                "probe": cmd_probe}
+    try:
+        return handlers[args.cmd](args)
+    except Fail as exc:
+        log(str(exc))
+        return exc.code
+    except (OSError, ValueError, KeyError) as exc:
+        log("error: %s: %s" % (exc.__class__.__name__, exc))
+        return 1
+
+
+if __name__ == "__main__":
+    sys.exit(main())

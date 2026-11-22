@@ -1,0 +1,22 @@
+# app.<domain> — CRM for office staff (tailnet IPv4). Body of the site block that
+# the global /etc/caddy/Caddyfile defines with its bind address and certificate.
+# Release-delivered (applier caddy-site): no site address, no `bind`.
+
+import legatto_vercel_headers
+request_body {
+	# Storage FILE_SIZE_LIMIT is 50 MiB; the app enforces its own 4.5 MB body limit.
+	max_size 52MB
+}
+import legatto_path_guard
+# Every `handle` below uses a named matcher: Caddy keeps named-matcher handles in
+# written order and sorts them before path-matcher handles, so these run first.
+# Sensitive functions are reachable only on admin.app.<domain> (office devices):
+# user management (Edge Functions admin-*), data export and admin API of the app.
+# public-submit-case is superseded by the public-site intake (PLAN A7).
+@legatto_admin_only path /functions/v1/admin-* /api/admin /api/admin/* /api/export /api/export/* /functions/v1/public-submit-case
+handle @legatto_admin_only {
+	respond 404
+}
+
+import legatto_supabase_routes crm
+import legatto_app_route crm

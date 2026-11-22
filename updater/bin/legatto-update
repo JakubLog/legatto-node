@@ -1,0 +1,16 @@
+#!/usr/bin/python3 -I
+"""Entry point installed as /opt/legatto/sbin/legatto-update.
+
+The package lives in /opt/legatto/lib/updater/legatto_update (role updater);
+from a checkout it is updater/legatto_update next to this bin/ directory.
+"""
+import os
+import sys
+
+_HERE = os.path.dirname(os.path.realpath(__file__))
+_INSTALLED = os.path.join(os.path.dirname(_HERE), "lib", "updater")
+sys.path.insert(0, _INSTALLED if os.path.isdir(_INSTALLED) else os.path.dirname(_HERE))
+
+from legatto_update.cli import main  # noqa: E402
+
+sys.exit(main())

@@ -1,0 +1,12 @@
+# vercel.json cron /api/cron/poliai-purge, schedule "30 3 * * *" (UTC, Vercel semantics).
+[Unit]
+Description=Legatto app cron poliai-purge (daily 03:30 UTC)
+
+[Timer]
+OnCalendar=*-*-* 03:30:00 UTC
+Persistent=true
+AccuracySec=1min
+Unit=legatto-cron@poliai-purge.service
+
+[Install]
+WantedBy=timers.target
