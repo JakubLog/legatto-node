@@ -77,9 +77,10 @@
     "source": {
       "type": "object",
       "additionalProperties": false,
-      "required": ["infra", "app"],
+      "required": ["infra", "node", "app"],
       "properties": {
         "infra": { "$ref": "#/$defs/git_source" },
+        "node": { "$ref": "#/$defs/git_source" },
         "app": {
           "description": "legatto-app release pinned by hash in a signed legatto-infra commit (R6).",
           "type": "object",
