@@ -97,7 +97,9 @@ sleep 1
 expect 0 "pgdump run (3)" run "$FILES/legatto-pgdump" run --json
 check "rotation keeps pgdump_keep=2 dumps" test "$(find "$PG" -mindepth 1 -maxdepth 1 -type d | wc -l | tr -d ' ')" = 2
 NEWEST=$(find "$PG" -mindepth 1 -maxdepth 1 -type d | sort | tail -1)
-check "dump files are 0600" test "$(stat -f %Lp "$NEWEST/db.dump" 2>/dev/null || stat -c %a "$NEWEST/db.dump")" = 600
+# python stat: `stat -f %Lp` (BSD) means a filesystem query under GNU stat and does not fail there
+check "dump files are 0600" test "$("$PY" -c 'import os, sys; print("%o" % (os.stat(sys.argv[1]).st_mode & 0o777))' \
+	"$NEWEST/db.dump")" = 600
 check "backup.json ok with Hetzner window" jq_py "$ST/backup.json" \
 	'd["ok"] and d["pgdump"]["state"] == "ok" and d["hetzner_window"] == "22-02" and len(d["pgdump"]["sha256"]) == 64'
 check "meta.json counts rows from the dump snapshot" jq_py "$NEWEST/meta.json" \
