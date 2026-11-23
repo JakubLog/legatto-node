@@ -286,6 +286,40 @@ class InstallTests(Base):
         self.assertEqual(self.e.installed(), "1.0.0")
         self.assertEqual(self.e.status()["pending"], [])
 
+    def test_installed_release_yanked(self):
+        self.bootstrap()
+        calls_before = len(self.e.calls("legatto-stack"))
+        # the vendor withdraws the installed release (release/yank.sh): new signed index
+        self.m.yanked.add("1.0.0")
+        self.m.index(2)
+        rel = self.m.releases["1.0.0"]
+        self.ok(self.e.run("run"))
+        st = self.e.status()
+        self.assertEqual((st["upd"], st["ok"], st["yanked"], st["yanked_reason"]), ("yanked", False, True, "test"))
+        self.assertEqual((self.e.installed(), self.e.current()), ("1.0.0", "1.0.0"))
+        events = [x for x in self.e.events() if x["event"] == "update.installed_yanked"]
+        self.assertEqual(len(events), 1)
+        self.assertEqual(events[0]["params"]["manifest_sha256"], rel.manifest_sha)
+        # no automatic rollback, no stack action; a second run audits nothing new
+        self.ok(self.e.run("run"))
+        self.assertEqual(len([x for x in self.e.events() if x["event"] == "update.installed_yanked"]), 1)
+        self.assertEqual(self.e.status()["upd"], "yanked")
+        self.assertFalse([e for e in self.e.event_names() if e.startswith("update.rolled_back")])
+        stack = self.e.calls("legatto-stack")[calls_before:]
+        self.assertFalse([c for c in stack if c[0] in ("stop", "migrate")], stack)
+        # a newer, not yanked release installs through the usual path and clears the state
+        self.next_release().build(self.m)
+        self.m.index(3)
+        self.ok(self.e.run("run"))
+        st = self.e.status()
+        self.assertEqual((self.e.installed(), st["upd"], st["yanked"], st["yanked_reason"]), ("1.1.0", "ok", False,
+                                                                                               None))
+
+    def test_yanked_reason_is_one_clean_line(self):
+        from legatto_update.chain import clean_reason
+        self.assertEqual(clean_reason("Błąd\n\x1b[31mmigracji\t  kontaktów"), "Błąd [31mmigracji kontaktów")
+        self.assertEqual(len(clean_reason("x" * 900)), 500)
+
     def test_worker_deployed_after_health(self):
         self.bootstrap()
         self.next_release(with_worker=True).build(self.m)

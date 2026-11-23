@@ -404,6 +404,24 @@ class Pages(PanelCase):
         self.assertEqual(b.request("GET", "/console/nie-ma")[0], 404)
         self.assertEqual(b.request("GET", "/console/dostep/okno/..%2F..%2Fetc")[0], 404)
 
+    def test_releases_page_warns_when_installed_release_is_yanked(self):
+        self.write_status()
+        path = self.tree.p(contract.STATUS_DIR + "/update.json")
+        with open(path, encoding="utf-8") as fh:
+            doc = json.load(fh)
+        b = self.browser()
+        self.login(b)
+        _status, _, html = b.request("GET", "/console/wydania")
+        self.assertNotIn("zostało wycofane przez dostawcę", html)
+        doc.update(upd="yanked", ok=False, yanked=True, yanked_reason="Błąd migracji <b>kontaktów</b>")
+        self.tree.write_json(contract.STATUS_DIR + "/update.json", doc, mode=0o644)
+        status, _, html = b.request("GET", "/console/wydania")
+        self.assertEqual(status, 200, html[:300])
+        self.assertIn("Zainstalowane wydanie 1.4.0 zostało wycofane przez dostawcę.", html)
+        self.assertIn("Błąd migracji &lt;b&gt;kontaktów&lt;/b&gt;", html)
+        self.assertIn("zainstalowane wydanie wycofane przez dostawcę", html)
+        self.assertIn("Serwer nie wycofuje go sam", html)
+
     def test_approve_and_features_from_the_panel(self):
         self.write_status()
         self.tree.fake(contract.CLI_UPDATE, {"approve": {"rc": 0, "stdout": {"ok": True, "code": "approved",

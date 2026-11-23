@@ -1,0 +1,54 @@
+---
+# Dependency and configuration scanners (Aneks 1 pkt 4: osv-scanner / trivy).
+# Both gate pull requests; the weekly run catches advisories published after
+# the last commit. Scanners run from images pinned by digest (same versions as
+# the vendor tool image: osv-scanner 2.7.1, trivy 0.76.2).
+name: scan
+on:
+  push:
+    branches: [main]
+  pull_request:
+  schedule:
+    - cron: "23 5 * * 1"
+  workflow_dispatch:
+permissions: {}
+concurrency:
+  group: scan-${{ github.ref }}-${{ github.event_name }}
+  cancel-in-progress: true
+jobs:
+  osv-scanner:
+    name: osv-scanner
+    runs-on: ubuntu-24.04
+    timeout-minutes: 20
+    permissions:
+      contents: read
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1  # v7.0.1
+        with:
+          persist-credentials: false
+      - name: osv-scanner (lockfiles)
+        run: |
+          docker run --rm -v "$PWD:/src:ro" -w /src \
+            ghcr.io/google/osv-scanner:v2.7.1@sha256:a70ffffc2bfd33482953e5d6b64c6fcdb30239717a07b0f0d3ab2859ce3e4cde \
+            scan source --recursive --allow-no-lockfiles .
+
+  trivy:
+    name: trivy
+    runs-on: ubuntu-24.04
+    timeout-minutes: 20
+    permissions:
+      contents: read
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1  # v7.0.1
+        with:
+          persist-credentials: false
+      - name: trivy fs (vulnerabilities, misconfiguration, secrets)
+        # bundle/compose/supabase is the unmodified upstream docker/ tree; tests/ holds
+        # throw-away test harness images (root, privileged by design, never shipped) and
+        # deliberately bad fixtures. Their base images are still digest-pinned
+        # (scripts/check-actions-pinned.sh).
+        run: |
+          docker run --rm -v "$PWD:/src:ro" -w /src \
+            ghcr.io/aquasecurity/trivy:0.76.2@sha256:8f6bb947dbc528902e11f2f5be52f7b519f6a39d5d148f41166f2040499768fb \
+            fs --scanners vuln,misconfig,secret --severity HIGH,CRITICAL --ignore-unfixed --exit-code 1 \
+            --skip-dirs bundle/compose/supabase --skip-dirs tests .

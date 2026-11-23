@@ -63,7 +63,7 @@ KUMA_FIELDS = (
     ("ch", r"^(canary|early|stable)$"),
     ("sig", r"^(ok|bad|none)$"),
     ("chk_age", r"^[0-9]{1,8}$"),
-    ("upd", r"^(ok|pending|waiting|installing|failed|rb|rej|vuln|stale|blocked-baseline|optout)$"),
+    ("upd", r"^(ok|pending|waiting|installing|failed|rb|rej|vuln|stale|yanked|blocked-baseline|optout)$"),
     ("disk", r"^[0-9]{1,3}$"),
     ("ram", r"^[0-9]{1,3}$"),
     ("bk", r"^(ok|fail|run|none)$"),
@@ -86,7 +86,7 @@ KUMA_FIELDS = (
 FIELD_RE = {key: re.compile(expr) for key, expr in KUMA_FIELDS}
 ERR = "ERR"
 
-UPD_DOWN = {"failed", "rb", "rej", "vuln", "stale"}
+UPD_DOWN = {"failed", "rb", "rej", "vuln", "stale", "yanked"}
 CHK_AGE_MAX = 86400
 BK_AGE_MAX_H = 26
 DISK_MAX = 90

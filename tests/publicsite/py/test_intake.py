@@ -11,7 +11,7 @@ import time
 import unittest
 from pathlib import Path
 
-from fixture import OFFICE_KID, Harness, make_envelope
+from fixture import OFFICE_KID, SIGNER_SEED, Harness, make_envelope
 
 from legatto_publicsite import envelope
 from legatto_publicsite.intake import scram_verifier
@@ -214,6 +214,59 @@ class IntakeTest(Harness):
         keygen = [d for d in self.jsonl("docker.jsonl") if d["command"][1] == "keygen"][0]
         self.assertEqual(keygen["network"], "none")
         self.assertTrue((self.root / "etc/credstore.encrypted/legatto-selftest-ed25519").exists())
+
+    # --- selftest --wait: the three proofs verify.sh form.selftest relies on --------------
+
+    def selftest(self, *extra: str) -> tuple[int, dict, str]:
+        # The fake Worker signs with the key worker-deploy would have uploaded (signers.d has its public half).
+        (self.state / "worker_signing_key").write_text(base64.b64encode(SIGNER_SEED).decode())
+        return self.tool("legatto-intake", "selftest", "--mode", "verify", *extra)
+
+    def test_selftest_without_wait_only_sends(self) -> None:
+        code, out, err = self.selftest()
+        self.assertEqual(code, 0, err)
+        self.assertEqual(out["sent"]["status"], 202)
+        self.assertNotIn("queue", out)
+        self.assertEqual(self.runs("fetch"), [])
+
+    def test_selftest_wait_proves_ciphertext_in_queue_storage_and_removal(self) -> None:
+        code, out, err = self.selftest("--wait", "30")
+        self.assertEqual(code, 0, err)
+        self.assertTrue(out["ok"])
+        self.assertEqual(out["queue"], {"bytes": envelope.ENVELOPE_SIZE, "fixed_size": True, "plaintext": [],
+                                        "opaque": True})
+        self.assertEqual((out["received"], out["removed"]), ("selftest", "accepted"))
+        self.assertRegex(out["ref"], r"^[0-9a-f]{8}$")
+        self.assertTrue(self.queue_messages()[out["msg_id"]]["acked"], "the ack reached the queue")
+        self.assertEqual(list(self.intake_dir("state/selftest").iterdir()), [], "the gate copy is removed")
+        self.assertIn("verify", self.runs("selftest")[0]["command"])
+        # pull + process, then the run that sends the ack
+        self.assertEqual(len(self.runs("fetch")), 2)
+
+    def test_selftest_plaintext_in_the_queue_fails_the_proof(self) -> None:
+        self.flag("selftest_plaintext")
+        code, out, _ = self.selftest("--wait", "30")
+        self.assertEqual(code, 32)
+        self.assertFalse(out["ok"])
+        self.assertFalse(out["queue"]["opaque"])
+        self.assertIn("marker", out["queue"]["plaintext"])
+
+    def test_selftest_ack_not_accepted_is_not_proof_of_removal(self) -> None:
+        self.flag("ack_lease_invalid")
+        code, out, _ = self.selftest("--wait", "30")
+        self.assertEqual((code, out["removed"]), (32, "unconfirmed"))
+        self.assertFalse(self.queue_messages()[out["msg_id"]]["acked"])
+
+    def test_selftest_lost_times_out(self) -> None:
+        self.flag("selftest_lost")
+        code, out, _ = self.selftest("--wait", "1")
+        self.assertEqual(code, 30)
+        self.assertEqual((out["queue"], out["received"], out["removed"]), (None, None, None))
+
+    def test_submissions_are_never_copied_by_the_selftest_trace(self) -> None:
+        self.push(make_envelope(), "m1")
+        self.fetch()
+        self.assertEqual(list(self.intake_dir("state/selftest").iterdir()), [])
 
     def test_db_role_password_is_sent_only_as_a_scram_verifier(self) -> None:
         (self.root / "etc/credstore.encrypted/legatto-db-publisher").unlink()

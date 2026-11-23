@@ -1,0 +1,45 @@
+{
+  "$schema": "https://docs.renovatebot.com/renovate-schema.json",
+  "description": "Aneks 1 pkt 4: updates only as pull requests for manual review; nothing merges automatically. contract/versions.yml (release inputs) is bumped by hand after two-source verification and is not managed here.",
+  "extends": [
+    "config:recommended",
+    "helpers:pinGitHubActionDigests",
+    ":dependencyDashboard",
+    ":semanticCommitsDisabled"
+  ],
+  "automerge": false,
+  "platformAutomerge": false,
+  "automergeType": "pr",
+  "pinDigests": true,
+  "minimumReleaseAge": "7 days",
+  "internalChecksFilter": "strict",
+  "prConcurrentLimit": 5,
+  "rangeStrategy": "pin",
+  "labels": ["dependencies"],
+  "enabledManagers": ["github-actions", "dockerfile", "npm", "nvm", "pre-commit", "custom.regex"],
+  "pre-commit": {
+    "enabled": true
+  },
+  "ignorePaths": [
+    "bundle/compose/supabase/**",
+    "contract/versions.yml"
+  ],
+  "packageRules": [
+    {
+      "description": "Never auto-merge anything, including digest and lockfile maintenance.",
+      "matchPackageNames": ["*"],
+      "automerge": false
+    }
+  ],
+  "customManagers": [
+    {
+      "customType": "regex",
+      "description": "Docker images run from workflow steps (docker run <image>:<tag>@sha256:<digest>).",
+      "managerFilePatterns": ["/^\\.github/workflows/[^/]+\\.ya?ml$/"],
+      "matchStrings": [
+        "(?<depName>(?:[a-z0-9.-]+/)?[a-z0-9._/-]+):(?<currentValue>[A-Za-z0-9._-]+)@(?<currentDigest>sha256:[0-9a-f]{64})"
+      ],
+      "datasourceTemplate": "docker"
+    }
+  ]
+}

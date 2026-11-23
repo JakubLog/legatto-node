@@ -34,6 +34,8 @@ scripts/lint.sh                    # yamllint, shellcheck, składnia Pythona, sc
 scripts/check-actions-pinned.sh    # akcje CI po SHA, obrazy po digest
 ```
 
+CI (`.github/workflows/`, akcje po SHA, obrazy po digest, bez sekretów): `lint`, `test` (każdy obszar osobno), `scan` (`osv-scanner` po lockfile'ach, `trivy fs`: podatności, błędy konfiguracji, sekrety), `secrets-scan` (`gitleaks` po całej historii). Zależności aktualizuje Renovate (`renovate.json`) wyłącznie przez pull requesty do ręcznego przeglądu, bez auto-merge; `contract/versions.yml` zmienia się ręcznie.
+
 Weryfikacja podpisu wydania na dowolnej maszynie:
 
 ```sh

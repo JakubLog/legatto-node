@@ -253,7 +253,7 @@ class Engine:
         if previous:
             st["history"] = [previous] + [h for h in st["history"] if h["version"] != version]
         st["installed"] = installed
-        st["flags"].update({"installing": None, "rb": None, "failed": None})
+        st["flags"].update({"installing": None, "rb": None, "failed": None, "yanked": None})
         st["failed_releases"].pop(sha, None)
         if st["flags"].get("vuln") and not semver_gt(st["flags"]["vuln"], version):
             st["flags"]["vuln"] = None

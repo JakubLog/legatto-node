@@ -5,9 +5,9 @@ import os
 from . import const
 from .host import fmt_ts, semver_gt
 
-UPD_ORDER = ("failed", "rb", "rej", "stale", "vuln", "blocked-baseline", "installing", "optout", "pending",
-             "waiting", "ok")
-DOWN = ("failed", "rb", "rej", "vuln", "stale")
+UPD_ORDER = ("failed", "rb", "rej", "stale", "yanked", "vuln", "blocked-baseline", "installing", "optout",
+             "pending", "waiting", "ok")
+DOWN = ("failed", "rb", "rej", "vuln", "stale", "yanked")
 PENDING_KEYS = ("version", "sequence", "type", "channel", "manifest_sha256", "state", "first_seen_at",
                 "promotion_first_seen_at", "earliest_install_at", "released_at", "expires", "min_installed",
                 "min_contract_version", "changelog_url", "notes_md", "advisories", "signers",
@@ -28,6 +28,9 @@ def compute_upd(store) -> str:
         found.add("rej")
     if flags.get("stale"):
         found.add("stale")
+    yanked = flags.get("yanked")
+    if yanked and inst and yanked.get("manifest_sha256") == inst["manifest_sha256"]:
+        found.add("yanked")
     if flags.get("vuln") and inst and semver_gt(flags["vuln"], inst["version"]):
         found.add("vuln")
     if flags.get("installing"):
@@ -60,6 +63,9 @@ def write_status(host, store, policy, now: float) -> dict:
     inst = st.get("installed")
     upd = compute_upd(store)
     sig = st.get("sig", "none")
+    yanked = st["flags"].get("yanked")
+    if not (inst and yanked and yanked.get("manifest_sha256") == inst["manifest_sha256"]):
+        yanked = None
     doc = {
         "v": 1,
         "component": "update",
@@ -68,6 +74,9 @@ def write_status(host, store, policy, now: float) -> dict:
         "installed": ({k: inst.get(k) for k in ("version", "sequence", "manifest_sha256", "installed_at")}
                       if inst else {"version": None, "sequence": None, "manifest_sha256": None,
                                     "installed_at": None}),
+        # The verified index marks the installed release as withdrawn (no automatic rollback).
+        "yanked": bool(yanked),
+        "yanked_reason": yanked["reason"] if yanked else None,
         "channel": policy["channel"] if policy else None,
         "sig": sig,
         "upd": upd,

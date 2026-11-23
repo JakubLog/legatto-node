@@ -8,7 +8,8 @@ from .host import CommandError
 SYSTEM_ACTOR = {"kind": "system", "id": const.TOOL}
 
 EVENTS = ("fetched", "verified", "rejected", "pending", "approved", "declined", "installing", "installed",
-          "rolled_back", "rollback_failed", "stale", "clock_jump", "autosecurity", "attested")
+          "rolled_back", "rollback_failed", "stale", "clock_jump", "autosecurity", "attested",
+          "installed_yanked")
 
 
 class AuditError(Exception):

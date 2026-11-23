@@ -24,7 +24,7 @@ def _empty_state():
         "last_check": {"ts": None, "ok": False, "ok_ts": None, "index_sequence": None, "index_expires": None},
         "sig": "none",
         "flags": {"rb": None, "failed": None, "stale": False, "rej": False, "vuln": None,
-                  "worker_pending": None, "installing": None},
+                  "worker_pending": None, "installing": None, "yanked": None},
         "failed_releases": {},
         "clock": None,
         "audited": {},

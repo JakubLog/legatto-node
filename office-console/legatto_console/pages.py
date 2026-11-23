@@ -80,6 +80,7 @@ UPD_STATE = {
     "installing": ("trwa instalacja", "warn"), "failed": ("instalacja nieudana", "bad"),
     "rb": ("wycofano wydanie", "bad"), "rej": ("wydanie odrzucone przez weryfikację", "bad"),
     "vuln": ("działa wersja ze znaną podatnością", "bad"), "stale": ("brak świeżego indeksu wydań", "bad"),
+    "yanked": ("zainstalowane wydanie wycofane przez dostawcę", "bad"),
     "blocked-baseline": ("zablokowane — wymaga prac serwisowych", "bad"),
     "optout": ("automatyczne poprawki wyłączone", "warn"),
 }
@@ -318,7 +319,16 @@ class View:
                                      f'<input type="hidden" name="enabled" value="{"true" if optout else "false"}">',
                                      "Włącz automatyczne poprawki" if optout else "Wyłącz automatyczne poprawki",
                                      style="" if optout else "danger"))
-        body = [top, f'<h2>Automatyczne poprawki bezpieczeństwa</h2><div class="card">{auto_html}</div>',
+        body = [top]
+        if update.get("yanked") or update.get("upd") == "yanked":
+            reason = update.get("yanked_reason")
+            body.append('<div class="flash error" role="alert"><strong>Zainstalowane wydanie '
+                        f'{h(installed.get("version", "—"))} zostało wycofane przez dostawcę.</strong> '
+                        + (f'Powód: {h(reason)}. ' if reason else "")
+                        + "Serwer nie wycofuje go sam. Nowsze wydanie zainstaluje się zwykłą drogą, gdy będzie "
+                          "dostępne; możesz też wycofać się do poprzedniej wersji poniżej albo skontaktować się "
+                          "z dostawcą.</div>")
+        body += [f'<h2>Automatyczne poprawki bezpieczeństwa</h2><div class="card">{auto_html}</div>',
                 "<h2>Oczekujące wydania</h2>"]
         if not pending:
             body.append('<div class="card"><p class="muted">Brak oczekujących wydań.</p></div>')

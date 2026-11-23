@@ -12,15 +12,22 @@
             container `intake.mjs process`: network legatto-int (database only),
             office X25519 key and DB role legatto_intake, NO external network.
             Reads ready/ (mounted as /intake/inbox), writes acks/ after commit.
-  selftest  signed POST /api/selftest through the Worker; --wait follows the
-            envelope until the processor reports the marker.
+  selftest  signed POST /api/selftest through the Worker (--mode verify: the
+            processor also files a "[VERIFY] <marker>" case in the CRM).
+            --wait S follows the envelope and proves, within S seconds:
+              queue    the message the Queues token pulled is a fixed-size
+                       ciphertext without the marker or any frame text (the
+                       host gate keeps a copy of self-test envelopes only);
+              received the processor stored it and reported the marker;
+              removed  Cloudflare accepted the ack (gone from the queue).
   keygen    office X25519 form key (container, no network) + self-test key.
   db-role   password of the DB roles legatto_intake / legatto_publisher (SCRAM verifier).
   status    contents of status/intake.json.
 
 Exit codes: 0 OK, 1 error, 2 usage, 3 locked, 4 precondition (no Cloudflare
-bootstrap, no release, no keys), 30 self-test not received in time,
-31 key already exists (keygen without --rotate).
+bootstrap, no release, no keys), 30 self-test not received or not removed in
+time, 31 key already exists (keygen without --rotate), 32 self-test proof
+failed (plaintext in the queue, or the ack was not accepted).
 """
 
 from __future__ import annotations
@@ -45,6 +52,7 @@ from .common import ContainerSpec, Credentials, Mount, fail, path
 TOOL = "legatto-intake"
 EXIT_SELFTEST_TIMEOUT = 30
 EXIT_KEY_EXISTS = 31
+EXIT_SELFTEST_FAILED = 32
 
 INTAKE_CLI = "/app/server/intake.mjs"
 CONTAINER_STATE = "/intake"
@@ -56,6 +64,8 @@ STATS_WINDOW_SECONDS = 24 * 3600
 FINAL_ACTIONS = {"ack"}
 MSG_ID_RE = re.compile(r"^[A-Za-z0-9._-]{1,128}$")
 MARKER_RE = re.compile(r"^[0-9a-f]{32}$")
+REF_RE = re.compile(r"^[0-9a-f]{8}$")
+UNIT_INTAKE_FETCH = "legatto-intake-fetch.service"  # contract: legatto_units.intake_fetch_service
 
 
 # --- state ------------------------------------------------------------------------------
@@ -70,6 +80,7 @@ class Dirs:
         self.acks = base / "acks"
         self.quarantine = base / "quarantine"
         self.state = base / "state"
+        self.selftest = self.state / "selftest"  # gate copies of self-test envelopes (root only)
 
     def prepare(self) -> None:
         common.ensure_dir(self.base, 0o750)
@@ -77,6 +88,7 @@ class Dirs:
         for directory in (self.inbox, self.ready, self.acks, self.quarantine):
             common.ensure_dir(directory, 0o700, common.CONTAINER_UID, common.CONTAINER_UID)
         common.ensure_dir(self.state, 0o700, 0, 0)
+        common.ensure_dir(self.selftest, 0o700, 0, 0)
 
 
 def _load_state(dirs: Dirs) -> dict[str, Any]:
@@ -85,6 +97,7 @@ def _load_state(dirs: Dirs) -> dict[str, Any]:
     state.setdefault("inflight", {})  # msg_id -> envelope sha256 (file in ready/)
     state.setdefault("events", [])  # [epoch s, "quarantined"|"retry"] for the 24 h failure count
     state.setdefault("selftest", {})  # marker -> {"outcome", "at"}
+    state.setdefault("selftest_queue", {})  # form ref -> {"msg_id", "at", "ack"}: self-test trace
     state.setdefault("backlog", None)
     state.setdefault("last_ok_at", None)
     return state
@@ -95,6 +108,10 @@ def _save_state(dirs: Dirs, state: dict[str, Any]) -> None:
     state["ledger"] = {k: v for k, v in state["ledger"].items() if now - v < LEDGER_TTL_SECONDS}
     state["events"] = [e for e in state["events"] if now - e[0] < STATS_WINDOW_SECONDS]
     state["selftest"] = {k: v for k, v in state["selftest"].items() if now - v["at"] < STATS_WINDOW_SECONDS}
+    for ref, trace in list(state["selftest_queue"].items()):
+        if now - trace["at"] >= STATS_WINDOW_SECONDS:
+            del state["selftest_queue"][ref]
+            (dirs.selftest / f"{ref}.bin").unlink(missing_ok=True)
     common.write_json_atomic(dirs.state / "state.json", state, 0o600)
 
 
@@ -135,6 +152,22 @@ def _quarantine(dirs: Dirs, msg: dict[str, Any], body: bytes, verdict: envelope.
     meta = {"reason": verdict.reason, "at": common.utc_now(), "queue": msg["queue"], "kind": verdict.kind,
             "sha256": verdict.digest, "gate": "host"}
     common.write_json_atomic(dirs.quarantine / f"{name}.json", meta, 0o600, common.CONTAINER_UID, common.CONTAINER_UID)
+
+
+def form_ref(body: bytes) -> str:
+    """Receipt number the Worker returns for an envelope: sha256 of the sealed form (worker/src/index.ts)."""
+    return hashlib.sha256(body[envelope.HEADER_SIZE + envelope.META_CT_SIZE:]).hexdigest()[:8]
+
+
+def _trace_selftest(dirs: Dirs, state: dict[str, Any], msg_id: str, body: bytes) -> None:
+    """Keeps the self-test envelope exactly as the Queues token pulled it, for `selftest --wait`.
+
+    Only outer kind 2 is copied; the Worker sets it on /api/selftest alone, which
+    the office self-test key authenticates, so no citizen submission is copied."""
+    ref = form_ref(body)
+    common.write_atomic(dirs.selftest / f"{ref}.bin", body, 0o600)
+    state["selftest_queue"][ref] = {"msg_id": msg_id, "at": time.time(), "ack": None}
+
 
 
 def gate(dirs: Dirs, state: dict[str, Any], now_ms: int | None = None) -> dict[str, Any]:
@@ -185,6 +218,8 @@ def gate(dirs: Dirs, state: dict[str, Any], now_ms: int | None = None) -> dict[s
         state["inflight"][msg_id] = verdict.digest
         inflight_digests[verdict.digest] = msg_id
         counts["ready"] += 1
+        if verdict.kind == "selftest":
+            _trace_selftest(dirs, state, msg_id, body)
     counts["reasons"] = reasons
     return counts
 
@@ -285,6 +320,38 @@ def _audit_quarantine(actor: dict[str, Any], count: int, reasons: dict[str, int]
         common.audit("intake", "intake.quarantine", actor, {"count": count, "reasons": reasons, "gate": gate_name})
 
 
+def _ack_actions(dirs: Dirs) -> dict[str, str]:
+    """msg_id -> action of every ack waiting in acks/ (what the next fetch run sends)."""
+    actions: dict[str, str] = {}
+    for entry in dirs.acks.glob("*.json"):
+        ack = common.read_json(entry)
+        actions[entry.stem] = str(ack.get("action")) if isinstance(ack, dict) else "?"
+    return actions
+
+
+def _trace_acks(dirs: Dirs, state: dict[str, Any], before: dict[str, str], out: dict[str, Any] | None) -> None:
+    """Self-test trace: did Cloudflare accept the ack of a traced self-test message?
+
+    The fetch container removes an ack file when Cloudflare accepted it or
+    rejected its lease, and reports only counters. When acked + retried equals
+    the number of files it removed and nothing is pending, every removed ack
+    was accepted; otherwise the outcome of each one is unknown ("unconfirmed")."""
+    sent = {m for m in before if not (dirs.acks / f"{m}.json").exists()}
+    traced = {t["msg_id"]: t for t in state["selftest_queue"].values() if t.get("ack") in (None, "retry")}
+    hits = sent & traced.keys()
+    if not hits:
+        return
+    accepted = (out is not None and not out.get("ack_pending")
+                and int(out.get("acked") or 0) + int(out.get("retried") or 0) == len(sent))
+    for msg_id in hits:
+        if before[msg_id] == "retry":
+            traced[msg_id]["ack"] = "retry"  # the processor failed; Cloudflare redelivers it
+        else:
+            traced[msg_id]["ack"] = "accepted" if accepted and before[msg_id] == "ack" else "unconfirmed"
+        traced[msg_id]["ack_at"] = time.time()
+
+
+
 # --- commands --------------------------------------------------------------------------------
 
 
@@ -297,8 +364,10 @@ def cmd_fetch(args: argparse.Namespace) -> int:
         state = _load_state(dirs)
         cf = common.cloudflare_config()
         image = _image()
+        acks_before = _ack_actions(dirs)
         with Credentials(TOOL) as creds:
             code, out = common.run_container(_fetch_spec(dirs, cf, creds, image), timeout=600)
+        _trace_acks(dirs, state, acks_before, out)
         fetch_ok = code in (0, 10) and out is not None
         if out is not None and out.get("backlog") is not None:
             state["backlog"] = out.get("backlog")
@@ -379,33 +448,78 @@ def cmd_selftest(args: argparse.Namespace) -> int:
     if not sent:
         common.emit(result)
         return common.EXIT_ERROR
-    if args.wait:
-        outcome = wait_for_marker(marker, args.wait)
-        result["received"] = outcome
-        result["ok"] = outcome is not None
+    if not args.wait:
         common.emit(result)
-        return common.EXIT_OK if outcome is not None else EXIT_SELFTEST_TIMEOUT
+        return common.EXIT_OK
+    ref = out.get("ref")
+    if not isinstance(ref, str) or not REF_RE.match(ref):
+        result.update(ok=False, error="the Worker answered without a receipt number (ref)")
+        common.emit(result)
+        return common.EXIT_ERROR
+    result.update(follow_selftest(marker, ref, args.wait))
+    queue, removed = result["queue"], result["removed"]
+    result["ok"] = bool(queue and queue["opaque"] and result["received"] and removed == "accepted")
     common.emit(result)
-    return common.EXIT_OK
+    if result["ok"]:
+        return common.EXIT_OK
+    if (queue and not queue["opaque"]) or removed == "unconfirmed":
+        return EXIT_SELFTEST_FAILED
+    return EXIT_SELFTEST_TIMEOUT
 
 
-def wait_for_marker(marker: str, timeout_s: int) -> str | None:
-    """Polls state/state.json for the processor's report of `marker`, kicking the fetch unit."""
+def queue_view(body: bytes, marker: str, site: str) -> dict[str, Any]:
+    """What the queue held: the envelope as the Queues token pulled it, judged without any key.
+
+    Opaque = the fixed envelope size of every submission, the LGF1 magic, and
+    none of the plaintext the self-test frame or the Worker metadata carry."""
+    tokens = {"marker": marker.encode(), "marker_bytes": bytes.fromhex(marker), "kind": b"selftest",
+              "frame": b'"marker"'}
+    if site:
+        tokens["site"] = site.encode()
+    found = sorted(name for name, token in tokens.items() if token in body)
+    fixed = len(body) == envelope.ENVELOPE_SIZE
+    return {"bytes": len(body), "fixed_size": fixed, "plaintext": found,
+            "opaque": fixed and body[:4] == envelope.MAGIC and not found}
+
+
+def follow_selftest(marker: str, ref: str, timeout_s: int) -> dict[str, Any]:
+    """Kicks the fetch unit until the self-test envelope was seen in the queue
+    (gate copy), stored by the processor (marker report) and acked in the queue."""
     dirs = Dirs()
     deadline = time.monotonic() + timeout_s
     systemctl = os.environ.get("LEGATTO_SYSTEMCTL", "systemctl")
+    site = common.office_env().get("LEGATTO_HOST_SITE", "")
+    queue: dict[str, Any] | None = None
+    received = removed = msg_id = None
+    progress: tuple | None = None
     while True:
-        # Each fetch run pulls, gates and (via the unit) processes; the
-        # processor reports self-test markers it decrypted.
-        subprocess.run([systemctl, "start", "legatto-intake-fetch.service"],  # contract: legatto_units.intake_fetch_service
-                       capture_output=True, check=False, timeout=900)
-        entry = _load_state(dirs)["selftest"].get(marker)
-        if entry:
-            return str(entry["outcome"])
+        # Each fetch run sends waiting acks, pulls, gates and (via the unit)
+        # processes; the processor reports self-test markers it decrypted.
+        subprocess.run([systemctl, "start", UNIT_INTAKE_FETCH], capture_output=True, check=False, timeout=900)
+        state = _load_state(dirs)
+        trace = state["selftest_queue"].get(ref)
+        if trace is not None:
+            msg_id, removed = trace["msg_id"], trace.get("ack")
+            if queue is None:
+                copy = dirs.selftest / f"{ref}.bin"
+                if copy.is_file():
+                    queue = queue_view(copy.read_bytes(), marker, site)
+                    copy.unlink()
+                else:
+                    queue = {"opaque": False, "error": "no copy of the queued envelope"}
+        entry = state["selftest"].get(marker)
+        received = str(entry["outcome"]) if entry else None
+        if received and removed in ("accepted", "unconfirmed"):
+            break
         remaining = deadline - time.monotonic()
         if remaining <= 0:
-            return None
+            break
+        stage = (queue is not None, received, removed)
+        if stage != progress:  # a step was reached: the next one is ready to run now
+            progress = stage
+            continue
         time.sleep(min(15.0, remaining))
+    return {"ref": ref, "msg_id": msg_id, "queue": queue, "received": received, "removed": removed}
 
 
 def cmd_keygen(args: argparse.Namespace) -> int:

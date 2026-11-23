@@ -51,7 +51,7 @@ Wpis (jedna linia JSON, UTF-8):
 - `params`: tylko dane techniczne. Bez treści spraw, nazwisk wyborców, e-maili, haseł, kodów TOTP i kluczy pre-auth. `reason` okna break-glass jest dozwolony (tekst wpisany przez admina biura).
 - Kategorie (`cat` = prefiks `event` do pierwszej kropki): `legatto_audit.categories`. Zdarzenia obowiązkowe:
   - net: `breakglass.enable|disable|expire|error|drift`, `ssh.login|logout|fail`, `sudo.command`, `admin.http`, `fw.apply|confirm|rollback`, `device.enroll|revoke`, `ansible.check|apply` (wpisy wywołuje playbook przez `legatto-audit append`);
-  - updater: `update.fetched|verified|rejected|pending|approved|declined|installing|installed|rolled_back|rollback_failed|stale|clock_jump|autosecurity|attested`;
+  - updater: `update.fetched|verified|rejected|pending|approved|declined|installing|installed|rolled_back|rollback_failed|stale|clock_jump|autosecurity|attested|installed_yanked` (`installed_yanked` raz na zmianę stanu: zainstalowane wydanie zostało wycofane w indeksie);
   - console (pisze executor; konsola nie pisze audytu): `console.request`, `console.login`, `console.login_failed`, `console.contacts.set` (typ żądania w spoolu to `contacts.set`), `console.user.{add,remove,reset_totp,password,setup,setup_code,emergency_rotate}`;
   - egress: `egress.applied|widening_held|denied` (`denied` zbiorczo, liczniki — bez nazw hostów spoza allowlisty);
   - ops: `backup.pgdump`, `backup.restore_test`, `backup.recovery_pack`;
@@ -135,7 +135,7 @@ Katalog `/var/lib/legatto/status/` (`0750 root:legatto-status`), pliki `<nazwa>.
 
 | Plik | Pisze (tor) | Pola poza kopertą |
 |---|---|---|
-| `update.json` | updater | `installed{version,sequence,manifest_sha256,installed_at}`, `channel`, `sig` (`ok\|bad\|none`), `upd` (enum jak w Kuma), `auto_security{policy,admin_optout}`, `last_check{ts,ok_ts,ok,index_sequence,index_expires}` (`ts` — ostatnia próba, `ok_ts` — ostatni udany fetch+verify indeksu; z niego liczony `chk_age`), `pending[]{version,sequence,type,manifest_sha256,state,earliest_install_at,egress_widening,changelog_url}`; `state` ∈ `waiting-promotion\|waiting-delay\|waiting-approval\|waiting-window\|blocked-baseline\|ready\|rejected\|expired` |
+| `update.json` | updater | `installed{version,sequence,manifest_sha256,installed_at}`, `channel`, `sig` (`ok\|bad\|none`), `upd` (enum jak w Kuma; `yanked` = zweryfikowany indeks oznacza zainstalowane wydanie jako wycofane — bez automatycznego rollbacku, serwer czeka na nowsze wydanie albo decyzję admina), `yanked` (bool), `yanked_reason` (tekst z podpisanego indeksu, jedna linia ≤ 500 znaków, `null` gdy nie dotyczy; nigdy nie trafia do Kuma), `auto_security{policy,admin_optout}`, `last_check{ts,ok_ts,ok,index_sequence,index_expires}` (`ts` — ostatnia próba, `ok_ts` — ostatni udany fetch+verify indeksu; z niego liczony `chk_age`), `pending[]{version,sequence,type,manifest_sha256,state,earliest_install_at,egress_widening,changelog_url}`; `state` ∈ `waiting-promotion\|waiting-delay\|waiting-approval\|waiting-window\|blocked-baseline\|ready\|rejected\|expired` |
 | `breakglass.json` | net | `active`, `window_id`, `actor`, `reason`, `started_at`, `expires_at` |
 | `audit.json` | net | `seq`, `head`, `verified_at`, `chain_ok` |
 | `tls.json` | platform | `not_after`, `days_left`, `last_renew_at`, `state` (`ok\|fail`) |
@@ -159,7 +159,7 @@ Szczegóły oczekujących wydań (changelog, różnica allowlisty egress) update
 | `ch` | `policy.json` | `^(canary\|early\|stable)$` |
 | `sig` | `update.json` | `^(ok\|bad\|none)$` |
 | `chk_age` | `update.json` | `^[0-9]{1,8}$` (sekundy) |
-| `upd` | `update.json` | `^(ok\|pending\|waiting\|installing\|failed\|rb\|rej\|vuln\|stale\|blocked-baseline\|optout)$` |
+| `upd` | `update.json` | `^(ok\|pending\|waiting\|installing\|failed\|rb\|rej\|vuln\|stale\|yanked\|blocked-baseline\|optout)$` |
 | `disk`, `ram` | system | `^[0-9]{1,3}$` (%) |
 | `bk`, `bk_age` | `backup.json` | `^(ok\|fail\|run\|none)$`, `^[0-9]{1,5}h$` |
 | `rt` | `restore-test.json` | `^(ok\|fail\|none)/[0-9]{1,4}d$` |
@@ -171,7 +171,7 @@ Szczegóły oczekujących wydań (changelog, różnica allowlisty egress) update
 | `egress`, `eg_deny` | `egress.json` | `^(observe\|enforce)$`, `^[0-9]{1,6}$` |
 | `in_age`, `in_q`, `in_fail`, `pub_age` | `intake.json`, `publish.json` | `^[0-9]{1,7}$` |
 
-`status=down`, gdy: `sig=bad`; `upd` ∈ {`failed`,`rb`,`rej`,`vuln`,`stale`}; `chk_age` > 86400; kontener unhealthy; `bk_age` > 26 h; dysk > 90 %; `in_age` > 900; `cert` < 14; łańcuch audytu uszkodzony.
+`status=down`, gdy: `sig=bad`; `upd` ∈ {`failed`,`rb`,`rej`,`vuln`,`stale`,`yanked`}; `chk_age` > 86400; kontener unhealthy; `bk_age` > 26 h; dysk > 90 %; `in_age` > 900; `cert` < 14; łańcuch audytu uszkodzony.
 
 ### 4.6 CLI narzędzi hosta
 
@@ -190,7 +190,7 @@ Wspólne zasady: `--json` → wynik na stdout jako jeden obiekt JSON; komunikaty
 | `rollback [--to V] --actor J` | powrót obrazów, konfiguracji i binariów; baza bez zmian |
 | `autosecurity --enabled true\|false --actor J` | opt-out admina (nie może włączyć, gdy `policy.auto_security=false`) |
 | `bootstrap --bundle DIR --actor J` | pierwsza instalacja; `DIR` to lustro w układzie `legatto_release_layout` (`index.json` + podpisy, `revoked.krl`, `releases/<v>/…`) skopiowane przez rolę updater z kontrolera ze zmiennej `legatto_update_bootstrap_bundle` (opcjonalna zmienna uruchomienia; rola woła bootstrap tylko, gdy nie ma zainstalowanego wydania). Te same reguły weryfikacji co `run` |
-| `attest --release V --report FILE` | tylko serwer canary: z raportu `scripts/verify.sh --release` bierze `result`, `failed_checks` i sha256 pliku; zapisuje `/var/lib/legatto/update/attest/<v>/canary.json` + `canary.json.canary.sig` (klucz `/etc/legatto/secrets/update-canary-ed25519`, tworzony przez rolę updater tylko przy `legatto_channel: canary`); audyt `update.attested`. Publikuje `release/publish.sh` |
+| `attest --release V --report FILE` | tylko serwer canary: z raportu `scripts/verify.sh --release` bierze `result`, `failed_checks` i sha256 pliku; zapisuje `/var/lib/legatto/update/attest/<v>/canary.json` + `canary.json.canary.sig` + kopię raportu `verify-report.json` (klucz `/etc/legatto/secrets/update-canary-ed25519`, tworzony przez rolę updater tylko przy `legatto_channel: canary`); audyt `update.attested`. Serwer niczego nie wysyła: na hosting wydań pliki przenosi dostawca narzędziem `attest-publish` (§4.7) |
 
 Raport testów akceptacyjnych canary (`--report FILE` narzędzia weryfikacji dostawcy), JSON: `{"v":1,"office":"<slug>","release":"<V>","manifest_sha256":"…","result":"PASS"|"FAIL","failed_checks":["<id>",…],"checks":[{"id":"<id>","result":"PASS"|"FAIL"|"SKIP","detail":"…"}],"started_at":"<UTC>","finished_at":"<UTC>"}`. `id` pasuje do `^[a-z0-9][a-z0-9._-]{0,80}$` (jak `failed_checks` w atestacji); `detail` bez danych osobowych.
 
@@ -241,7 +241,7 @@ Kody: 40 `diff` wykrył poszerzenie (updater wstrzymuje wydanie do zgody), 41 wy
 **`legatto-cf-bootstrap`** (publicsite; root; tylko z roli `cf_bootstrap` w oknie break-glass): jednorazowy token Cloudflare biura (TTL 24 h) wyłącznie na stdin; tworzy kolejki, Turnstile, projekt Pages, tokeny biura (Queues, Pages/Workers, DNS-01 strefy) z filtrem IP i zapisuje je do `/etc/credstore.encrypted/` (`legatto_credentials`). Żaden token nie wraca do kontrolera ani do logu. Jawne identyfikatory (konto, strefa, kolejki, sitekey) trafiają do `/etc/legatto/publicsite/cloudflare.json`. Pozostałe ścieżki toru: `intake_etc`, `cf_ca_bundle`, `publish_state`, `worker_state` w `legatto_paths`.
 
 Pełne podkomendy publicsite (kody wyjścia są per narzędzie; wspólne 0–4 jak wyżej):
-- `legatto-intake fetch|process|selftest|status|keygen [--rotate]|db-role --role legatto_intake|legatto_publisher` — `db-role` generuje hasło roli na serwerze i przekazuje do Postgresa tylko weryfikator SCRAM przez `docker exec -i supabase-db psql` na stdin (hasło nigdy w argv ani w logu);
+- `legatto-intake fetch|process|selftest|status|keygen [--rotate]|db-role --role legatto_intake|legatto_publisher` — `db-role` generuje hasło roli na serwerze i przekazuje do Postgresa tylko weryfikator SCRAM przez `docker exec -i supabase-db psql` na stdin (hasło nigdy w argv ani w logu). `selftest [--mode ping|verify] [--marker HEX32] [--wait S]` — podpisany POST `/api/selftest` przez Workera; `--mode verify` dodatkowo zakłada w CRM sprawę „[VERIFY] <marker>”. `--wait S` w ciągu S sekund dowodzi trzech rzeczy: (1) wiadomość pobrana z kolejki tokenem Queues to szyfrogram stałej wielkości (25 278 B, magic `LGF1`) bez znacznika i tekstu ramki — bramka hosta zachowuje kopię wyłącznie kopert self-testu (rodzaj 2); (2) procesor zapisał ją i zgłosił znacznik; (3) Cloudflare przyjął ack (wiadomość znikła z kolejki). Wynik JSON: `queue`, `received`, `removed` (`accepted`|`unconfirmed`|`retry`). Kody: 30 = nie dotarło albo nie usunięte w czasie, 31 = klucz istnieje (`keygen`), 32 = dowód nieudany (jawny tekst w kolejce albo ack nieprzyjęty). Test akceptacyjny formularza (kryterium `form.selftest`) wywołuje `selftest --mode verify --wait 300`, sprawdza sprawę w CRM i potem ją usuwa;
 - `legatto-site-publish run|drift|status|guard --dir D` — kod 20: strażnik „zero adresu” odrzucił build;
 - `legatto-worker-deploy --release-dir D [--actor J] [--no-selftest] [--selftest-timeout S] [--force]`, `legatto-worker-deploy status` — kody 0/1/2/3/4 jak wspólne, 60 = wdrożenie nieudane i wycofane w Cloudflare. `--no-selftest` i `--force` są tylko do pracy w oknie break-glass; updater ich nie używa.
 
@@ -279,6 +279,11 @@ Dziś istnieje jeden klucz sprzętowy: `release-b` (zapasowy offline) zostanie d
 5. Opóźnienia liczone od lokalnego first-seen dokumentu promocji: `min_delay_hours[type][channel]` z `policy.json` (min. feature 24/48 h, security 2/4 h); `promoted_at` niczego nie przyspiesza. Skok zegara > `clock_jump_block_minutes` blokuje instalację.
 6. `type=feature` zawsze czeka na `update.approve`. Każde poszerzenie egress (`legatto-egress diff` → 40) wstrzymuje całe wydanie do zgody admina, niezależnie od typu. `security` instaluje się sam w `install_window`, gdy `auto_security` i brak opt-outu admina.
 7. Health check (`healthchecks` z manifestu, limit `health_timeout_seconds`); porażka → auto-rollback obrazów, konfiguracji i binariów, baza bez zmian.
+
+**Publikacja na hostingu** (narzędzia dostawcy w prywatnym repo; serwer tylko czyta). Obiekty w `releases/<v>/` są niezmienne. `index.json` i `transparency.log` zmieniają się przez compare-and-swap. `transparency.log` to JSONL z łańcuchem hashy; każda zmiana dopisuje do niego wpis: `release.published`, `release.attested`, `release.promoted`, `release.yanked`, `index.resigned`, `index.published`.
+- `attest-publish`: pobiera atestację z serwera canary (`legatto_paths.update_attest/<v>/`, SSH w oknie break-glass canary) albo z kopii lokalnej. Sprawdza schemat, podpis `canary@` (`legatto-canary`, `allowed_signers`), zgodność `manifest_sha256`/`version`/`sequence` z opublikowanym, podpisanym manifestem i wpisem indeksu oraz `verify_report_sha256`. Wgrywa `attest/verify-report.json`, `attest/canary.json.canary.sig` i na końcu `attest/canary.json`. Indeksu nie zmienia: `attestation_sha256` wpisuje dopiero promocja. Opublikowany wynik `FAIL` jest ostateczny dla tej wersji.
+- `resign-index`: nowy podpis indeksu bez zmian w wydaniach (`sequence` + 1, `issued_at` = teraz, `expires` = `issued_at` + `legatto_index_validity_days`). Dostawca uruchamia go co najmniej raz w miesiącu, gdy nie było publikacji ani promocji, i po wygaśnięciu indeksu (`upd=stale`).
+- `yank`: ustawia `yanked: true` i `yanked_reason` (publiczny, ≤ 500 znaków). Wpis zostaje w indeksie, więc wersji ani `sequence` nie da się użyć ponownie; flagi nie da się cofnąć. Updater pomija wpisy `yanked` (nie pobiera ich i nie instaluje na żadnym kanale), a promocja i `attest-publish` ich odmawiają. Serwer, który już zainstalował wycofane wydanie, zostaje na nim do następnego (zdalnego rollbacku nie ma) i dziś nie zgłasza tego stanu osobno.
 
 ### 4.8 Paczka i appliery
 

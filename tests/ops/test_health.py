@@ -186,6 +186,9 @@ class HealthPayload(unittest.TestCase):
                                     last_check={"ok_ts": ts()})),
             ("upd", lambda b: b.put("update", installed={"version": "1.5.0"}, sig="ok", upd="rb",
                                     last_check={"ok_ts": ts()})),
+            # installed release withdrawn in the verified index: down, the reason text never reaches Kuma
+            ("upd", lambda b: b.put("update", installed={"version": "1.5.0"}, sig="ok", upd="yanked", yanked=True,
+                                    yanked_reason="Wycofane: błąd migracji", last_check={"ok_ts": ts()})),
             ("chk_age", lambda b: b.put("update", installed={"version": "1.5.0"}, sig="ok", upd="ok",
                                         last_check={"ok_ts": ts(timedelta(hours=25))})),
             ("chk_age", lambda b: b.put("update", installed={"version": "1.5.0"}, sig="ok", upd="ok",
@@ -208,6 +211,7 @@ class HealthPayload(unittest.TestCase):
                 payload = box.dry()
                 self.assert_clean(payload)
                 self.assertEqual(payload["status"], "down", (reason, payload))
+                self.assertNotIn("migracji", json.dumps(payload))
                 proc = box.run("collect", "--json")
                 self.assertEqual(proc.returncode, 0, proc.stderr)
                 self.assertIn(reason, json.loads(proc.stdout)["reasons"])

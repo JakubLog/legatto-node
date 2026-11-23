@@ -315,7 +315,7 @@ Kroki:
 2. **Build**: z zatwierdzonej treści repozytoriów, `contract/versions.yml` i `bundle/**`. Przebudowuje obrazy aplikacji z przypiętego commita i wymaga identycznych digestów. Wynik: manifest zgodny ze schematem `release/schema/manifest.schema.json`, SBOM-y i allowlista egress w `manifest.egress`.
 3. **Podpis**: przed dotknięciem klucza narzędzie sprawdza paczkę, porównuje ją z niezależnym buildem z CI (artefakt z weryfikowaną atestacją pochodzenia), pokazuje podsumowanie i diff względem poprzedniego wydania (w tym poszerzenia egress). Podpis: `ssh-keygen -Y sign -n legatto-release` kluczem `ed25519-sk` (PIN i dotyk).
 4. **Publikacja**: artefakty jako obiekty niezmienne, potem podpisy, manifest, wpis do `transparency.log` (JSONL z łańcuchem hashy), podpisany `index.json`.
-5. **Canary** instaluje każde poprawne wydanie i po testach akceptacyjnych podpisuje atestację programowym kluczem serwera canary (`legatto-update attest`, namespace `legatto-canary`).
+5. **Canary** instaluje każde poprawne wydanie i po testach akceptacyjnych podpisuje atestację programowym kluczem serwera canary (`legatto-update attest`, namespace `legatto-canary`). Dostawca pobiera atestację, sprawdza jej podpis i zgodność z opublikowanym manifestem, wgrywa ją jako obiekt niezmienny do `releases/<wersja>/attest/` i dopisuje wpis `release.attested` do `transparency.log` (bez użycia klucza wydań).
 6. **Promocja** do `early` i `stable`: wymaga atestacji `PASS` dla dokładnie tego manifestu; `stable` wymaga też ważnej promocji `early`. Dokument promocji i nowy indeks są podpisane kluczem sprzętowym.
 7. **Pull i weryfikacja na serwerze** (§4.3): serwer liczy minimalne opóźnienie od chwili, w której **sam** pierwszy raz zobaczył promocję swojego kanału (`promoted_at` niczego nie przyspiesza):
 
@@ -325,6 +325,8 @@ Kroki:
 | `feature` | ≥ 24 h | ≥ 48 h |
 
    Wydanie `feature` zawsze czeka na zgodę admina biura w panelu. Każde poszerzenie allowlisty egress wstrzymuje całe wydanie do zgody, niezależnie od typu. `security` instaluje się samo w oknie instalacji (`legatto_install_window`), chyba że admin wyłączył automat. Skok zegara > 60 min blokuje instalację.
+
+   Indeks jest ważny 35 dni. Gdy w tym czasie nie ma nowego wydania ani promocji, dostawca podpisuje ten sam indeks ponownie z wyższym `sequence`; bez tego serwery niczego nie instalują i zgłaszają `upd=stale`. Wycofane wydanie ma w indeksie `yanked: true` z powodem: serwer pomija je przy wyborze wydań, a serwer, który już je ma, czeka na nowsze wydanie.
 
 Klucze zaufania na serwerze (`/etc/legatto/update/allowed_signers`, `policy.json`, początkowy KRL) zmienia wyłącznie dostawca w oknie break-glass otwartym przez biuro. Wymagana liczba podpisów: `signatures_required` (dziś 1).
 

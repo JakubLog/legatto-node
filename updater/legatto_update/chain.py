@@ -38,6 +38,11 @@ def load_policy(host) -> dict:
     return policy
 
 
+def clean_reason(text: str) -> str:
+    """yanked_reason as shown to the office admin: printable text only, one line, <= 500 chars."""
+    return " ".join("".join(ch if ch.isprintable() else " " for ch in str(text)).split())[:500]
+
+
 def rel_release(version: str, name: str) -> str:
     return "releases/%s/%s" % (version, name)
 
@@ -239,6 +244,7 @@ class Chain:
         ev["index_ok"] = True
         ev["index"] = index
         inst = self.installed()
+        self._installed_yanked(index, inst)
         for entry in sorted(index["releases"], key=lambda r: r["sequence"]):
             if entry["yanked"]:
                 continue
@@ -254,6 +260,26 @@ class Chain:
         if ready:
             ev["chosen"] = max(ready, key=lambda c: c["sequence"])
         return ev
+
+    def _installed_yanked(self, index: dict, inst) -> None:
+        """Rule: a yanked release is never installed; a server already running it
+        reports it (upd=yanked, audit once per change) and waits for a newer one.
+        No automatic rollback: the office admin or the vendor decides."""
+        flags = self.store.state["flags"]
+        entry = None
+        if inst:
+            entry = next((r for r in index["releases"] if r["version"] == inst["version"]
+                          and r["manifest_sha256"] == inst["manifest_sha256"]), None)
+        if entry is None or not entry["yanked"]:
+            flags["yanked"] = None
+            return
+        reason = clean_reason(entry.get("yanked_reason", ""))
+        previous = flags.get("yanked")
+        flags["yanked"] = {"version": inst["version"], "manifest_sha256": inst["manifest_sha256"],
+                           "reason": reason, "since": (previous or {}).get("since") or fmt_ts(self.now)}
+        if not previous or previous.get("manifest_sha256") != inst["manifest_sha256"]:
+            self.queue("installed_yanked", {"version": inst["version"], "manifest_sha256": inst["manifest_sha256"],
+                                            "sequence": inst["sequence"], "index_sequence": index["sequence"]})
 
     def _accept_krl(self, krl_sha: str, ev: dict) -> bool:
         stored = os.path.join(self.host.state(const.KRL_STORE), krl_sha + ".krl")

@@ -99,10 +99,12 @@ def intake_fetch(spec: dict) -> None:
     acked = retried = 0
     acks = host(spec, "/intake/acks")
     by_id = {m["id"]: m for m in queue["messages"]}
+    lease_rejected = (STATE / "ack_lease_invalid").exists()  # Cloudflare: lease no longer valid
     for ack_file in sorted(acks.glob("*.json")):
         ack = json.loads(ack_file.read_text())
         msg = by_id.get(ack["msg_id"])
-        if msg and not msg["acked"] and msg["lease"] == ack["lease_id"] and msg["leased_until"] > now:
+        if (msg and not lease_rejected and not msg["acked"] and msg["lease"] == ack["lease_id"]
+                and msg["leased_until"] > now):
             if ack["action"] == "ack":
                 msg["acked"] = True
                 acked += 1
@@ -172,14 +174,16 @@ def intake_selftest(spec: dict, args: list[str]) -> None:
     markers = load("pending_markers.json", [])
     markers.append(marker)
     save("pending_markers.json", markers)
-    # The Worker would now enqueue a selftest envelope.
+    # The Worker would now enqueue a selftest envelope (selftest_plaintext: a
+    # broken Worker that lets the frame text into the queue).
     form_key = json.loads(host(spec, "/etc/legatto/intake/form-key.json").read_text())
-    envelope = worker_envelope(2, bytes.fromhex(form_key["kid"]))
+    leak = ('{"kind":"selftest","marker":"%s"}' % marker).encode() if (STATE / "selftest_plaintext").exists() else b""
+    envelope = worker_envelope(2, bytes.fromhex(form_key["kid"]), leak)
     queue = load("queue.json", {"messages": []})
     queue["messages"].append({"id": f"selftest-{marker[:8]}", "body_b64": base64.b64encode(envelope).decode(), "lease": None,
                               "leased_until": 0, "acked": False, "attempts": 0, "sent": time.time()})
     save("queue.json", queue)
-    out({"ok": True, "status": 202, "ref": "0badf00d"})
+    out({"ok": True, "status": 202, "ref": hashlib.sha256(envelope[654:]).hexdigest()[:8]})  # sha256 of the sealed form
 
 
 def intake_keygen(spec: dict, args: list[str]) -> None:
@@ -189,7 +193,7 @@ def intake_keygen(spec: dict, args: list[str]) -> None:
     out({"kid": hashlib.sha256(pub).hexdigest()[:16], "x25519": base64.b64encode(pub).decode()})
 
 
-def worker_envelope(kind: int, office_kid: bytes) -> bytes:
+def worker_envelope(kind: int, office_kid: bytes, leak: bytes = b"") -> bytes:
     """Envelope signed with the Worker key that worker-deploy uploaded (like the real Worker)."""
     sys.path.insert(0, os.environ.get("FAKE_SBIN", "/opt/legatto/sbin"))
     from legatto_publicsite import ed25519, envelope
@@ -198,6 +202,7 @@ def worker_envelope(kind: int, office_kid: bytes) -> bytes:
     header = (envelope.MAGIC + bytes([envelope.VERSION, kind]) + office_kid
               + ed25519.key_id(ed25519.public_key(seed)) + int(time.time() * 1000).to_bytes(8, "big"))
     rest = os.urandom(envelope.META_CT_SIZE + envelope.FORM_CT_SIZE)
+    rest = rest[:envelope.META_CT_SIZE] + leak + rest[envelope.META_CT_SIZE + len(leak):]
     return header + ed25519.sign(seed, envelope.SIGNATURE_DOMAIN + header + rest) + rest
 
 

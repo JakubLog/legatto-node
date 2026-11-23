@@ -2,14 +2,12 @@
 
 ## 1. Zgłaszanie podatności
 
-Podatności w Legatto zgłaszaj **prywatnie** przez GitHub Security Advisories:
+Podatności w Legatto zgłaszaj **prywatnie**:
 
-- oprogramowanie serwera biura (to repozytorium): `https://github.com/JakubLog/legatto-node/security/advisories/new`;
-- aplikacja: `https://github.com/JakubLog/legatto/security/advisories/new`.
+- oprogramowanie serwera biura (to repozytorium): GitHub Security Advisories, `https://github.com/JakubLog/legatto-node/security/advisories/new` (prywatne zgłaszanie podatności jest włączone);
+- aplikacja (`JakubLog/legatto`): e-mailem na `kontakt@legatto.pl` z tematem „Podatność". Prywatne zgłaszanie podatności nie jest jeszcze włączone w tym repozytorium (stan na 2026-11-23); po włączeniu kanałem będzie `https://github.com/JakubLog/legatto/security/advisories/new`.
 
-Nie zgłaszaj podatności w publicznych issues.
-
-> **Do uzupełnienia:** domena Legatto nie ma dziś adresu `security@` (są tylko `kontakt@legatto.pl`, `rodo@legatto.pl` i `formularz@legatto.pl`). Prywatne zgłaszanie podatności trzeba włączyć w ustawieniach obu repozytoriów (Settings → Code security → Private vulnerability reporting). Do tego czasu kanałem jest `kontakt@legatto.pl` z tematem „Podatność".
+Nie zgłaszaj podatności w publicznych issues. Domena Legatto nie ma osobnego adresu `security@`; `kontakt@legatto.pl` jest też kanałem zapasowym dla serwera biura.
 
 W zgłoszeniu podaj: komponent i wersję (panel biura → Wydania pokazuje wersję), kroki odtworzenia, skutek. Nie testuj na serwerach biur — wszystkie serwery produkcyjne przetwarzają dane wyborców.
 
@@ -91,4 +89,4 @@ Jedynym backupem poza serwerem jest wbudowany backup Hetzner (7 dziennych obraz�
 - Kod działający na serwerze biura jest publiczny (to repozytorium, AGPL-3.0-only), tak samo aplikacja. Narzędzia wdrożeniowe dostawcy (playbooki, budowanie i publikacja wydań) są prywatne; nie zmieniają tego, co serwer przyjmie — o tym decyduje kod z tego repozytorium (weryfikacja podpisów, kanały, zgoda biura, break-glass).
 - Akcje GitHub przypięte po pełnym SHA, obrazy po digest; CI bez sekretów i bez publikacji, workflowy z `permissions: {}` i uprawnieniami per job. Wydanie podpisuje człowiek kluczem sprzętowym poza CI.
 - `gitleaks` w pre-commit i w CI.
-- **Stan na 2026-11-22:** repo aplikacji nie ma jeszcze chronionej gałęzi `main` ani wymogu SHA pinningu; to repozytorium nie jest jeszcze opublikowane na GitHubie.
+- **Stan na 2026-11-23:** oba repozytoria są publiczne. Repo aplikacji nie ma jeszcze chronionej gałęzi `main`; w obu repozytoriach nie są jeszcze wymagane podpisane commity, wymagane checki CI ani SHA pinning po stronie GitHuba (sprawdza to `scripts/check-github-settings.sh` w repo dostawcy). Zależności tego repozytorium aktualizuje Renovate wyłącznie przez pull requesty do ręcznego przeglądu; `osv-scanner` i `trivy fs` działają w CI (`.github/workflows/scan.yml`).
