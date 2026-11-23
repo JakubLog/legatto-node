@@ -523,7 +523,7 @@ legatto_roles:
   - {name: worker_deployer, lane: publicsite}
   - {name: recovery_pack, lane: ops}
 
-# --- Ansible run gate (Aneks 1 pkt 1) -----------------------------------------------
+# --- Ansible run gate (vendor tooling: plan -> accept -> apply, one office at a time) ------
 legatto_play_serial: 1
 legatto_play_max_fail_percentage: 0
 legatto_playbooks: [bootstrap, service, restore-test]

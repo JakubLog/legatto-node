@@ -1,0 +1,173 @@
+{
+  "compose_project": "legatto",
+  "container": {
+    "acl_path": "/etc/smokescreen/acl.yaml",
+    "listen": "0.0.0.0",
+    "port": 4750,
+    "resolver": "9.9.9.9:53"
+  },
+  "container_proxies": {
+    "app": {
+      "clients": [
+        "app"
+      ],
+      "ext_ip": "172.30.255.2",
+      "network": "egress_app",
+      "service": "egress-app"
+    },
+    "auth": {
+      "clients": [
+        "auth"
+      ],
+      "ext_ip": "172.30.255.3",
+      "network": "egress_auth",
+      "service": "egress-auth"
+    },
+    "functions": {
+      "clients": [
+        "functions"
+      ],
+      "ext_ip": "172.30.255.4",
+      "network": "egress_fn",
+      "service": "egress-fn"
+    },
+    "intake": {
+      "clients": [
+        "intake-fetch"
+      ],
+      "ext_ip": "172.30.255.5",
+      "network": "egress_intake",
+      "service": "egress-intake"
+    },
+    "publish": {
+      "clients": [
+        "site-publisher",
+        "worker-deployer"
+      ],
+      "ext_ip": "172.30.255.6",
+      "network": "egress_publish",
+      "service": "egress-publish"
+    }
+  },
+  "contract_version": 1,
+  "dns_blackhole": "172.30.0.53",
+  "docker": {
+    "daemon_json": "/etc/docker/daemon.json",
+    "host_network": "legatto-host",
+    "internal_networks": [
+      "legatto-int",
+      "legatto-egress-app",
+      "legatto-egress-auth",
+      "legatto-egress-fn",
+      "legatto-egress-intake",
+      "legatto-egress-publish"
+    ]
+  },
+  "dot_resolvers": [
+    "9.9.9.9",
+    "149.112.112.112"
+  ],
+  "feature_defaults": {
+    "ai": false,
+    "email": false,
+    "getresponse": false,
+    "hibp": true,
+    "ics": false,
+    "mcp": false,
+    "push": false
+  },
+  "feature_names": [
+    "ai",
+    "mcp",
+    "email",
+    "getresponse",
+    "push",
+    "ics",
+    "hibp"
+  ],
+  "host_proxy": {
+    "clients": [
+      "root",
+      "_apt",
+      "legatto-mon",
+      "legatto-acme",
+      "headscale"
+    ],
+    "listen": "127.0.0.1",
+    "port": 4750,
+    "unit": "legatto-egress-proxy.service",
+    "user": "smokescreen"
+  },
+  "ics_role": "app",
+  "mode": "observe",
+  "modes": [
+    "observe",
+    "enforce"
+  ],
+  "nft": {
+    "chain_fwd": "egress_fwd",
+    "chain_out": "egress_out",
+    "docker_bridges": [
+      "br-legatto",
+      "br-lgt-int",
+      "br-lgt-egx",
+      "br-lgt-eapp",
+      "br-lgt-eauth",
+      "br-lgt-efn",
+      "br-lgt-eintk",
+      "br-lgt-epub"
+    ],
+    "egress_ext_bridge": "br-lgt-egx",
+    "family": "inet",
+    "metadata_ip": "169.254.169.254",
+    "table": "legatto",
+    "tailscale_if": "tailscale0",
+    "wireguard_port": 41641
+  },
+  "nodns_units": [
+    "legatto-caddy.service",
+    "legatto-console.service"
+  ],
+  "office_entries": [
+    {
+      "host": "legatto-example.example",
+      "port": 443,
+      "purpose": "MP site: intake selftest (POST /api/selftest)",
+      "role": "intake"
+    },
+    {
+      "host": "legatto-example.example",
+      "port": 443,
+      "purpose": "MP site: health check after a Worker deploy (GET /api/health)",
+      "role": "publish"
+    }
+  ],
+  "paths": {
+    "audit_cli": "/opt/legatto/sbin/legatto-audit",
+    "current": "/opt/legatto/current",
+    "etc": "/etc/legatto/egress",
+    "features": "/var/lib/legatto/office/features.json",
+    "lock": "/run/legatto/egress.lock",
+    "nft_file": "/etc/nftables.d/egress.nft",
+    "pinned": "/etc/legatto/egress/pinned.json",
+    "proxy_dir": "/etc/legatto/egress/proxy",
+    "rendered_dir": "/etc/legatto/egress/rendered",
+    "state_dir": "/var/lib/legatto/egress",
+    "status_dir": "/var/lib/legatto/status"
+  },
+  "roles": [
+    "host",
+    "app",
+    "auth",
+    "functions",
+    "intake",
+    "publish"
+  ],
+  "status_group": "legatto-status",
+  "system_users": {
+    "ntp": "_chrony",
+    "resolver": "systemd-resolve",
+    "wireguard": "root"
+  },
+  "v": 1
+}

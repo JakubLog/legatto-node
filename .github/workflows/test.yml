@@ -1,0 +1,30 @@
+---
+# All tests of the public server code (tests/run.sh), one job per area.
+name: test
+on:
+  push:
+    branches: [main]
+  pull_request:
+permissions: {}
+concurrency:
+  group: test-${{ github.ref }}
+  cancel-in-progress: true
+jobs:
+  test:
+    name: test (${{ matrix.area }})
+    runs-on: ubuntu-24.04
+    timeout-minutes: 45
+    permissions:
+      contents: read
+    strategy:
+      fail-fast: false
+      matrix:
+        area: [net, platform, updater, console, publicsite, ops, egress]
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1  # v7.0.1
+        with:
+          persist-credentials: false
+      - name: tests/${{ matrix.area }}
+        env:
+          AREA: ${{ matrix.area }}
+        run: tests/run.sh "$AREA"

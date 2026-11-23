@@ -1,7 +1,7 @@
 ---
 # Pinned upstream versions, hashes and image digests. Owner: integrator.
 #
-# Rules (Aneks 1 pkt 4):
+# Rules (supply chain):
 #   - every artifact is pinned by sha256, every image by digest; tags are
 #     comments for humans only;
 #   - a value is written here only after it was checked against two
@@ -172,7 +172,7 @@ legatto_egress_proxy_source:
   commit: 609eb8931420453daf5893509be0b25b21bd9edb
 
 # --- Vendor infrastructure (not on office servers) -----------------------------------------
-# Global Uptime Kuma on the vendor's Mikr.us host (U6), vendor/kuma/compose.yml (lane ops).
+# Global Uptime Kuma on the vendor's monitoring host (vendor tooling, not in this repository).
 # Verified 2026-11-22: registry manifest (buildx imagetools) and Docker Hub tags API.
 legatto_vendor_images:
   uptime_kuma:

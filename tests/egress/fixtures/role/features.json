@@ -1,0 +1,14 @@
+{
+  "features": {
+    "ai": false,
+    "email": false,
+    "getresponse": false,
+    "hibp": true,
+    "ics": false,
+    "mcp": false,
+    "push": false
+  },
+  "ics_hosts": [],
+  "updated_at": "2026-11-21T10:00:00Z",
+  "v": 1
+}

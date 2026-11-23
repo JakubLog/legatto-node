@@ -1,0 +1,27 @@
+// Rendered on the server by legatto-policy from acl.hujson.j2. Do not edit by hand.
+// Variant: normal
+{
+  "groups": {
+    "group:staff": ["anna@", "jan.kowalski@"],
+    "group:vendor": ["v-jan@", "v-ola@"],
+  },
+  // Only root on the server (headscale CLI) mints tagged pre-auth keys.
+  "tagOwners": {
+    "tag:server": [],
+    "tag:office-device": [],
+  },
+  "hosts": {
+    "crm": "100.64.0.1/32",
+    // admin.app.<domain> and studio.app.<domain> share the IPv6 listener.
+    "admin": "fd7a:115c:a1e0::1/128",
+    "ssh": "100.64.0.1/32",
+  },
+  "grants": [
+    {"src": ["group:staff"], "dst": ["crm"], "ip": ["tcp:443"]},
+    {"src": ["tag:office-device"], "dst": ["crm", "admin"], "ip": ["tcp:443"]},
+  ],
+  // Tailscale SSH is not used; OpenSSH listens on the server's tailnet IPv4.
+  "ssh": [],
+  // Keep WireGuard on the fixed port 41641 (firewall rule).
+  "randomizeClientPort": false,
+}

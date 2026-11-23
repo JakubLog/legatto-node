@@ -28,9 +28,10 @@ Narzędzia wdrożeniowe dostawcy (playbooki instalacji, budowanie i publikacja w
 ## Sprawdzanie
 
 ```sh
+tests/run.sh                       # wszystkie testy (docker, python3 >= 3.12, yq, yamllint, shellcheck)
+tests/run.sh updater console       # wybrane obszary
 scripts/lint.sh                    # yamllint, shellcheck, składnia Pythona, schematy
 scripts/check-actions-pinned.sh    # akcje CI po SHA, obrazy po digest
-(cd worker && npm ci && npm run build && npm test)
 ```
 
 Weryfikacja podpisu wydania na dowolnej maszynie:

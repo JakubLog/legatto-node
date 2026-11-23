@@ -6,7 +6,7 @@
 # Response headers from legatto-app vercel.json "headers". The Node server sets the
 # same values on its own responses; `?` only fills in what a response lacks (api-gw,
 # Caddy errors, the office console), so the app stays the source of truth.
-# tests/platform keeps this list equal to vercel.json.
+# The vendor's deployment tests keep this list equal to the app's vercel.json.
 (legatto_vercel_headers) {
 	header {
 		?X-Frame-Options "DENY"

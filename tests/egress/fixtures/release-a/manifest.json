@@ -1,0 +1,42 @@
+{
+  "schema": "legatto-release/1",
+  "version": "1.4.0",
+  "egress": {
+    "version": 1,
+    "roles": {
+      "host": [
+        {"host": "updates.legatto.pl", "port": 443, "purpose": "release server"},
+        {"host": "archive.ubuntu.com", "port": 80, "purpose": "Ubuntu archive"},
+        {"host": "security.ubuntu.com", "port": 80, "purpose": "Ubuntu security"},
+        {"host": "acme-v02.api.letsencrypt.org", "port": 443, "purpose": "ACME"},
+        {"host": "api.cloudflare.com", "port": 443, "purpose": "Cloudflare DNS-01"}
+      ],
+      "app": [
+        {"host": "api.resend.com", "port": 443, "purpose": "auth e-mails"}
+      ],
+      "intake": [
+        {"host": "api.cloudflare.com", "port": 443, "purpose": "Queues"}
+      ],
+      "publish": [
+        {"host": "api.cloudflare.com", "port": 443, "purpose": "Pages and Workers"}
+      ]
+    },
+    "features": {
+      "ai": {"app": [{"host": "api.anthropic.com", "port": 443, "purpose": "Anthropic"}]},
+      "mcp": {},
+      "email": {"app": [{"host": "api.resend.com", "port": 443, "purpose": "notifications"}]},
+      "getresponse": {
+        "app": [{"host": "api.getresponse.com", "port": 443, "purpose": "GetResponse"}],
+        "functions": [{"host": "api.getresponse.com", "port": 443, "purpose": "GetResponse"}]
+      },
+      "push": {
+        "app": [
+          {"host": "fcm.googleapis.com", "port": 443, "purpose": "FCM"},
+          {"host": "*.push.apple.com", "port": 443, "purpose": "APNs web push"}
+        ]
+      },
+      "ics": {},
+      "hibp": {"auth": [{"host": "api.pwnedpasswords.com", "port": 443, "purpose": "HIBP"}]}
+    }
+  }
+}

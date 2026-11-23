@@ -1,0 +1,3 @@
+{"v": 1, "updated_at": "2026-11-21T10:00:00Z",
+ "features": {"ai": false, "mcp": true, "email": false, "getresponse": false, "push": false, "ics": true, "hibp": false},
+ "ics_hosts": ["calendar.example.org", "ics.example.net"]}

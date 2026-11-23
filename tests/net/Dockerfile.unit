@@ -1,0 +1,11 @@
+# Test image for the net lane: Ubuntu 24.04 (the server OS) with the packages
+# the host tools need, plus the validators (nft, visudo, sshd, chronyd) for the
+# rendered role configs. Used by tests/net/run.sh (and by the vendor repo,
+# which renders the role templates and validates them in the same image).
+FROM ubuntu:24.04@sha256:9c7f200c07e3d4a03e7249d2c16bf66a51120fb876aa2242cf31451412543289
+
+ENV DEBIAN_FRONTEND=noninteractive
+RUN apt-get update \
+ && apt-get install -y --no-install-recommends \
+      python3 python3-jinja2 python3-yaml nftables sudo openssh-server chrony e2fsprogs \
+ && rm -rf /var/lib/apt/lists/*

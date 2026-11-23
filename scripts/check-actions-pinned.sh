@@ -1,5 +1,5 @@
 #!/usr/bin/env bash
-# Supply-chain pinning and workflow policy check (Aneks 1 pkt 4; PLAN F5b).
+# Supply-chain pinning and workflow policy check.
 #
 # Fails when, under ROOT:
 #   GitHub workflows / composite actions (.github/workflows/*.y*ml, .github/actions/**/action.y*ml)

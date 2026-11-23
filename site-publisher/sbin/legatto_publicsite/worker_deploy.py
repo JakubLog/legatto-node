@@ -1,5 +1,5 @@
 """legatto-worker-deploy — deploys the legatto-forms Worker from a verified
-release bundle to the office's own Cloudflare account (pull, Aneks 1).
+release bundle to the office's own Cloudflare account (pull model).
 
 Called by legatto-update after a green health check when the manifest has a
 `worker-bundle` artifact (applier `worker`), and once by the worker_deployer

@@ -1,0 +1,29 @@
+{
+  "entries": [
+    {
+      "host": "updates.legatto.pl",
+      "port": 443,
+      "purpose": "updates",
+      "role": "host"
+    },
+    {
+      "host": "status.legatto-example.example",
+      "port": 443,
+      "purpose": "monitoring",
+      "role": "host"
+    },
+    {
+      "host": "security.ubuntu.com",
+      "port": 80,
+      "purpose": "os-security-updates",
+      "role": "host"
+    },
+    {
+      "host": "archive.ubuntu.com",
+      "port": 80,
+      "purpose": "os-security-updates",
+      "role": "host"
+    }
+  ],
+  "v": 1
+}
