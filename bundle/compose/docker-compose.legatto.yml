@@ -99,7 +99,6 @@ networks:
 volumes:
   db-data:
   storage-data:
-  studio-snippets:
 
 secrets:
   pii_field_key:
@@ -191,25 +190,18 @@ services:
     profiles: [disabled]
     ports: !reset []
 
+  # Studio and postgres-meta are not shipped (no images in the bundle): the database
+  # is administered only through migrations and, in a break-glass window, psql.
   meta:
-    <<: *hardening
-    image: "@@LEGATTO_IMAGE:meta@@"
-    profiles: [admin]
+    profiles: [disabled]
 
   studio:
-    <<: *hardening
-    image: "@@LEGATTO_IMAGE:studio@@"
-    profiles: [admin]
-    environment:
-      OPENAI_API_KEY: !reset null
-      NEXT_TELEMETRY_DISABLED: "1"
-    volumes: !override
-      - studio-snippets:/app/snippets
+    profiles: [disabled]
 
   api-gw:
     <<: *hardening
     image: "@@LEGATTO_IMAGE:api-gw@@"
-    # Upstream waits for a healthy Studio; Studio is optional (profile admin).
+    # Upstream waits for a healthy Studio, which never runs (profile disabled).
     depends_on: !reset []
     ports: !reset []
     networks:

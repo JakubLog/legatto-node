@@ -312,15 +312,18 @@ def check_oci_archive(path: str, digests: list) -> None:
 # --- staging -----------------------------------------------------------------------------------
 def stage_release(host, manifest: dict, manifest_bytes: bytes, sigs: dict, art_dir: str, stage: str,
                   office_env: dict) -> None:
-    """Build releases/.staging-<v>: manifest, signatures, artifacts (not images), config, migrations."""
+    """Build releases/.staging-<v>: manifest, signatures, artifacts, config, migrations.
+
+    Every artifact is a hard link of the verified download, image archives included:
+    the kept release is the source the next release reuses unchanged archives from
+    (Chain.ensure_artifacts), so an unchanged image is never downloaded twice."""
     os.makedirs(stage, mode=0o755)
     host.write_bytes(os.path.join(stage, "manifest.json"), manifest_bytes, mode=0o644)
     for signer_id, data in sigs.items():
         host.write_bytes(os.path.join(stage, "manifest.json.%s.sig" % signer_id), data, mode=0o644)
     for a in manifest["artifacts"]:
         src = os.path.join(art_dir, a["name"])
-        if a["kind"] != "oci-archive":
-            copy_file(src, os.path.join(stage, "artifacts", a["name"]))
+        copy_file(src, os.path.join(stage, "artifacts", a["name"]))
         if a["kind"] == "config":
             appliers = {f["path"]: f["applier"] for f in a["files"]}
             for rel, data in tar_contents(src, const.MAX_CONFIG_BYTES).items():

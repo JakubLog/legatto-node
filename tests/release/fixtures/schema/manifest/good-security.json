@@ -1,0 +1,196 @@
+{
+  "advisories": [
+    {
+      "id": "GHSA-xxxx-yyyy-zzzz",
+      "severity": "high",
+      "summary": "Poprawka w GoTrue",
+      "url": "https://github.com/advisories/GHSA-xxxx-yyyy-zzzz"
+    }
+  ],
+  "artifacts": [
+    {
+      "binaries": [
+        {
+          "name": "caddy",
+          "sha256": "1111111111111111111111111111111111111111111111111111111111111111",
+          "version": "2.11.9"
+        }
+      ],
+      "kind": "binary",
+      "name": "caddy-2.11.9",
+      "sha256": "1111111111111111111111111111111111111111111111111111111111111111",
+      "size": 40000000
+    },
+    {
+      "files": [
+        {
+          "applier": "compose",
+          "path": "compose/docker-compose.legatto.yml",
+          "sha256": "3333333333333333333333333333333333333333333333333333333333333333"
+        },
+        {
+          "applier": "caddy-site",
+          "path": "caddy/sites.d/crm.caddy.tmpl",
+          "sha256": "4444444444444444444444444444444444444444444444444444444444444444"
+        }
+      ],
+      "kind": "config",
+      "name": "config.tar.gz",
+      "sha256": "2222222222222222222222222222222222222222222222222222222222222222",
+      "size": 9876
+    },
+    {
+      "kind": "deb",
+      "name": "headscale_0.29.7_linux_amd64.deb",
+      "packages": [
+        {
+          "name": "headscale",
+          "sha256": "5555555555555555555555555555555555555555555555555555555555555555",
+          "version": "0.29.7"
+        }
+      ],
+      "sha256": "5555555555555555555555555555555555555555555555555555555555555555",
+      "size": 20183728
+    },
+    {
+      "kind": "oci-archive",
+      "name": "image-app.tar",
+      "sha256": "6666666666666666666666666666666666666666666666666666666666666666",
+      "size": 61234567
+    },
+    {
+      "kind": "sql-migrations",
+      "name": "migrations.tar.gz",
+      "sha256": "7777777777777777777777777777777777777777777777777777777777777777",
+      "size": 2345
+    },
+    {
+      "kind": "notes",
+      "name": "notes.md",
+      "sha256": "8888888888888888888888888888888888888888888888888888888888888888",
+      "size": 1200
+    },
+    {
+      "kind": "sbom",
+      "name": "sbom-image-app.cdx.json",
+      "sha256": "9999999999999999999999999999999999999999999999999999999999999999",
+      "size": 456789
+    },
+    {
+      "kind": "worker-bundle",
+      "name": "worker.tar.gz",
+      "sha256": "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa",
+      "size": 30000,
+      "worker": {
+        "entry_sha256": "bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb",
+        "script_name": "legatto-forms"
+      }
+    }
+  ],
+  "changelog_url": "https://updates.legatto.pl/v1/releases/1.5.1/notes.md",
+  "channels": [
+    "canary",
+    "early",
+    "stable"
+  ],
+  "crons": [
+    {
+      "name": "sync-ics",
+      "path": "/api/cron/sync-ics",
+      "schedule": "0 4 * * *"
+    }
+  ],
+  "egress": {
+    "features": {
+      "mcp": {},
+      "push": {
+        "app": [
+          {
+            "host": "*.push.apple.com",
+            "port": 443,
+            "purpose": "Web Push (Apple)"
+          }
+        ]
+      }
+    },
+    "roles": {
+      "host": [
+        {
+          "host": "updates.legatto.pl",
+          "port": 443,
+          "purpose": "updates"
+        }
+      ]
+    },
+    "version": 1
+  },
+  "expires": "2027-01-20T10:00:00Z",
+  "functions": [
+    "admin-create-user",
+    "device-login"
+  ],
+  "healthchecks": [
+    "compose:all-healthy",
+    "http:crm:/healthz",
+    "sql:migration-level",
+    "egress:selftest",
+    "worker:selftest"
+  ],
+  "images": [
+    {
+      "artifact": "image-app.tar",
+      "digest": "sha256:cccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccc",
+      "name": "app",
+      "platform": "linux/amd64",
+      "ref": "ghcr.io/jakublog/legatto/app:2.3.0"
+    },
+    {
+      "artifact": null,
+      "digest": "sha256:dddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddd",
+      "name": "db",
+      "platform": "linux/amd64",
+      "ref": "docker.io/supabase/postgres:17.6.1.136"
+    }
+  ],
+  "migrations": {
+    "count": 1,
+    "files": [
+      {
+        "name": "20261121090000_add_case_tags.sql",
+        "sha256": "eeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeee"
+      }
+    ],
+    "from": "20261116100000",
+    "n_minus_1_compatible": true,
+    "to": "20261121090000"
+  },
+  "min_contract_version": 1,
+  "min_installed": "1.4.0",
+  "product": "legatto",
+  "released_at": "2026-11-21T10:00:00Z",
+  "rollback": "images-only",
+  "sbom": [
+    {
+      "artifact": "sbom-image-app.cdx.json",
+      "format": "cyclonedx-json",
+      "subject": "image app"
+    }
+  ],
+  "schema": "legatto-release/1",
+  "sequence": 13,
+  "source": {
+    "app": {
+      "commit": "bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb",
+      "release_sha256": "cccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccc",
+      "repo": "github.com/JakubLog/legatto",
+      "version": "2.3.0"
+    },
+    "node": {
+      "commit": "dddddddddddddddddddddddddddddddddddddddd",
+      "repo": "github.com/JakubLog/legatto-node"
+    },
+    "supabase_selfhosted": "0.8.4"
+  },
+  "type": "security",
+  "version": "1.5.1"
+}

@@ -1,0 +1,75 @@
+---
+# Reference build of a release bundle (R6, P13) in this public repository:
+# the build provenance (actions/attest-build-provenance) is verifiable by
+# anyone with `gh attestation verify`. CI holds no keys and publishes
+# nothing: it runs release/build.sh exactly like the vendor's `make release`
+# and uploads only the unsigned manifest.json with its provenance. The vendor
+# signs a release only when the local manifest matches this one.
+name: release-build
+on:
+  push:
+    tags: ["v[0-9]+.[0-9]+.[0-9]+*"]
+  workflow_dispatch:
+    inputs:
+      version:
+        description: "Release version x.y.z (release/notes/<version>.json must exist)"
+        required: true
+        type: string
+permissions: {}
+concurrency:
+  group: release-build-${{ github.ref }}
+  cancel-in-progress: false
+jobs:
+  build:
+    name: release-build
+    runs-on: ubuntu-24.04
+    timeout-minutes: 120
+    permissions:
+      contents: read
+      id-token: write       # build provenance (OIDC), no long-lived secret
+      attestations: write
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1  # v7.0.1
+        with:
+          persist-credentials: false
+          fetch-depth: 0    # the egress image epoch is the last commit of egress/image
+      - name: Resolve version
+        id: version
+        env:
+          INPUT_VERSION: ${{ inputs.version }}
+          REF_NAME: ${{ github.ref_name }}
+        run: |
+          version="${INPUT_VERSION:-${REF_NAME#v}}"
+          if [[ ! "$version" =~ ^(0|[1-9][0-9]*)\.(0|[1-9][0-9]*)\.(0|[1-9][0-9]*)(-[0-9A-Za-z.-]+)?$ ]]; then
+            echo "not a release version: $version" >&2
+            exit 2
+          fi
+          echo "version=$version" >> "$GITHUB_OUTPUT"
+      - name: Free runner disk for container images
+        run: sudo rm -rf /usr/share/dotnet /usr/local/lib/android /opt/ghc /opt/hostedtoolcache/CodeQL
+      - name: Docker with the containerd image store (digests kept as pulled)
+        run: |
+          conf=/etc/docker/daemon.json
+          [[ -s "$conf" ]] || echo '{}' | sudo tee "$conf" >/dev/null
+          sudo jq '. + {"features": {"containerd-snapshotter": true}}' "$conf" | sudo tee "$conf.new" >/dev/null
+          sudo mv "$conf.new" "$conf"
+          sudo systemctl restart docker
+          docker info -f '{{ .DriverStatus }}' | grep -q 'io.containerd.snapshotter' \
+            || { echo "containerd image store not active" >&2; exit 1; }
+      - name: Install pinned tools (syft, yq)
+        run: sudo release/install-tools.sh --prefix /usr/local
+      - name: release/build.sh
+        env:
+          VERSION: ${{ steps.version.outputs.version }}
+        run: release/build.sh --version "$VERSION" --no-reuse-published
+      - name: Build provenance for manifest.json
+        uses: actions/attest-build-provenance@4d101475d8b20a2381f78447822ac1eab6504dd8  # v4.2.2
+        with:
+          subject-path: release/out/${{ steps.version.outputs.version }}/manifest.json
+      - name: Upload reference manifest
+        uses: actions/upload-artifact@cf430e030ddbb5b0abf93d22962f4752f3646cd9  # v7.0.2
+        with:
+          name: release-${{ steps.version.outputs.version }}-manifest
+          path: release/out/${{ steps.version.outputs.version }}/manifest.json
+          if-no-files-found: error
+          retention-days: 90

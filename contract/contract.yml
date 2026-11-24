@@ -47,19 +47,18 @@ legatto_envs: [prod, test]
 legatto_slug_regex: "^[a-z][a-z0-9-]{1,30}$"
 
 # --- Hostnames (U5) -----------------------------------------------------------
-# Only vpn.<domain> has a public DNS record pointing at the VPS. app/admin/studio
+# Only vpn.<domain> has a public DNS record pointing at the VPS. app/admin.app
 # exist only as Headscale extra_records (MagicDNS + split DNS). <domain> itself
 # is the MP's public site on Cloudflare Pages (office account).
 legatto_hostname_site: "{{ legatto_office_domain }}"
 legatto_hostname_vpn: "vpn.{{ legatto_office_domain }}"
 legatto_hostname_crm: "app.{{ legatto_office_domain }}"
 legatto_hostname_admin: "admin.app.{{ legatto_office_domain }}"
-legatto_hostname_studio: "studio.app.{{ legatto_office_domain }}"
 # MagicDNS base domain must not contain the Headscale server_url host.
 legatto_magicdns_base_domain: "tn.{{ legatto_office_domain }}"
 legatto_server_node_name: "{{ legatto_office_slug }}-srv"
 # One DNS-01 certificate (lego) for the tailnet-only names; the wildcard keeps
-# admin./studio. out of CT logs.
+# admin. out of CT logs.
 legatto_tls_cert_names:
   - "{{ legatto_hostname_crm }}"
   - "*.{{ legatto_hostname_crm }}"
@@ -74,8 +73,8 @@ legatto_caa:
 legatto_tailnet_prefix_v4: 100.64.0.0/10
 legatto_tailnet_prefix_v6: "fd7a:115c:a1e0::/48"
 legatto_tailnet_allocation: sequential
-# Listener binding (D4): crm on the server's tailnet IPv4, admin+studio on its
-# tailnet IPv6; the ACL distinguishes them by address.
+# Listener binding (D4): crm on the server's tailnet IPv4, admin on its tailnet
+# IPv6; the ACL distinguishes them by address.
 legatto_listen_crm: "{{ legatto_ts_ip4 }}:443"
 legatto_listen_admin: "[{{ legatto_ts_ip6 }}]:443"
 legatto_listen_ssh: "{{ legatto_ts_ip4 }}:22"
@@ -101,7 +100,7 @@ legatto_ports:
     wireguard: {proto: udp, port: 41641}
   tailnet:
     ssh: 22                           # ts_ip4, only during a break-glass window
-    https: 443                        # crm on ts_ip4, admin/studio on ts_ip6
+    https: 443                        # crm on ts_ip4, admin on ts_ip6
   local:
     headscale_metrics: 9090           # 127.0.0.1
     headscale_grpc: 50443             # 127.0.0.1
@@ -161,7 +160,7 @@ legatto_egress_container_proxies:
   intake: {service: egress-intake, network: egress_intake, ext_ip: 172.30.255.5, clients: [intake-fetch]}
   publish: {service: egress-publish, network: egress_publish, ext_ip: 172.30.255.6,
             clients: [site-publisher, worker-deployer]}
-legatto_egress_proxy_env_no_proxy: "api-gw,kong,envoy,db,rest,auth,storage,realtime,meta,functions,app,localhost,127.0.0.1"
+legatto_egress_proxy_env_no_proxy: "api-gw,kong,envoy,db,rest,auth,storage,realtime,functions,app,localhost,127.0.0.1"
 # Host proxy (127.0.0.1:4750): the only local users nft lets reach it. Every
 # other uid is dropped before the loopback accept.
 legatto_egress_host_proxy_clients: [root, _apt, legatto-mon, legatto-acme, headscale]
@@ -178,13 +177,12 @@ legatto_feature_names: [ai, mcp, email, getresponse, push, ics, hibp]
 legatto_feature_defaults: {ai: false, mcp: false, email: false, getresponse: false, push: false, ics: false, hibp: true}
 
 # --- Compose services ------------------------------------------------------------
-legatto_compose_services: [db, auth, rest, realtime, storage, functions, api-gw, app, meta, studio,
+legatto_compose_services: [db, auth, rest, realtime, storage, functions, api-gw, app,
                            egress-app, egress-auth, egress-fn, egress-intake, egress-publish]
-legatto_compose_profile_admin: admin          # meta + studio, off by default (P9)
-legatto_compose_profile_disabled: disabled    # imgproxy, supavisor
+legatto_compose_profile_disabled: disabled    # upstream services never started: imgproxy, supavisor, meta, studio
 # Names of manifest images[].name; compose templates reference them as
 # @@LEGATTO_IMAGE:<name>@@, replaced with ref@digest by release/build.sh.
-legatto_image_names: [db, auth, rest, realtime, storage, api-gw, meta, studio, functions, app, migrator, egress-proxy]
+legatto_image_names: [db, auth, rest, realtime, storage, api-gw, functions, app, migrator, egress-proxy]
 legatto_container_db: supabase-db
 
 # --- System users and groups -----------------------------------------------------
@@ -233,7 +231,6 @@ legatto_paths:
   caddy_cert: /etc/caddy/certs/app.crt       # app.<domain> + *.app.<domain> (lego DNS-01)
   caddy_key: /etc/caddy/certs/app.key
   acme_state: /var/lib/legatto-acme          # lego account + certificates, 0700 legatto-acme
-  studio_state: /var/lib/legatto/studio.json
   nft_main: /etc/nftables.conf
   nft_include_dir: /etc/nftables.d           # egress.nft (egress lane)
   var: /var/lib/legatto
@@ -249,7 +246,7 @@ legatto_paths:
   requests_archive: /var/lib/legatto/requests/archive
   console_state: /var/lib/legatto/console    # 0750 root:legatto-console; written only by the executor
   console_users: /var/lib/legatto/console/users.json        # registry + scrypt hashes, 0640 root:legatto-console
-  console_snapshot: /var/lib/legatto/console/snapshot.json  # tailnet nodes + Studio state for the panel, 0640
+  console_snapshot: /var/lib/legatto/console/snapshot.json  # tailnet nodes + staff list for the panel, 0640
   console_auth: /var/lib/legatto/console-auth  # root-only: last accepted TOTP step per user
   console_totp_seeds: /etc/legatto/secrets/console-totp
   recovery_password: /etc/legatto/secrets/recovery-password  # 0400 root; generated on the server (R10)
@@ -295,7 +292,6 @@ legatto_office_env:
   LEGATTO_HOST_VPN: "{{ legatto_hostname_vpn }}"
   LEGATTO_HOST_CRM: "{{ legatto_hostname_crm }}"
   LEGATTO_HOST_ADMIN: "{{ legatto_hostname_admin }}"
-  LEGATTO_HOST_STUDIO: "{{ legatto_hostname_studio }}"
   LEGATTO_TS_IP4: "{{ legatto_ts_ip4 }}"
   LEGATTO_TS_IP6: "{{ legatto_ts_ip6 }}"
   LEGATTO_PUBLIC_IPV4: "{{ legatto_public_ipv4 }}"
@@ -332,7 +328,6 @@ legatto_units:
   stack: legatto-stack.service
   secrets_render: legatto-secrets-render.service
   secrets_render_path: legatto-secrets-render.path          # re-render env files after features.json changes
-  studio_reconcile: legatto-studio-reconcile.timer          # expires Studio windows, survives reboot
   cron_template: legatto-cron@.service
   cron_timer_prefix: legatto-cron-
   # updater
@@ -377,7 +372,6 @@ legatto_cli:
   site_publish: legatto-site-publish
   worker_deploy: legatto-worker-deploy
   tailnet: legatto-tailnet                   # net: enroll/revoke nodes, staff list
-  studio: legatto-studio                     # platform: Studio on demand (compose profile admin)
   secrets: legatto-secrets                   # platform: generate server-side secrets (idempotent)
   stack: legatto-stack                       # platform (role app): up|down|status --json|check|migrate|cron NAME|probe
   acme: legatto-acme                         # platform (role proxy): renew|install|status; from legatto-acme.service
@@ -392,8 +386,7 @@ legatto_audit:
   writer: legatto-audit append              # the single writer (flock); nobody else opens the file
   genesis_prev: "0000000000000000000000000000000000000000000000000000000000000000"
   fields: [seq, ts, host, cat, event, actor, node, params, prev, hash]
-  categories: [ansible, breakglass, ssh, sudo, admin, fw, update, console, egress, backup, intake, publish, studio,
-               device]
+  categories: [ansible, breakglass, ssh, sudo, admin, fw, update, console, egress, backup, intake, publish, device]
 
 # --- Spool: office-console -> root executor ------------------------------------------
 legatto_requests:
@@ -407,8 +400,6 @@ legatto_requests:
     - update.reject
     - update.rollback
     - update.autosecurity
-    - studio.enable
-    - studio.disable
     - device.enroll
     - device.revoke
     - staff.set
@@ -438,8 +429,8 @@ legatto_signature:
     canary: legatto-canary                   # attest/canary.json (canary server key)
     plan: legatto-plan                       # Ansible plan acceptance (operator key)
   principals:
-    release: [release-a@legatto.pl, release-b@legatto.pl]   # b = offline backup key (U8, pending)
-    canary: [canary@legatto.pl]
+    release: [release-a@legatto.pl, release-b@legatto.pl]   # a = YubiKey YK-2, b = offline YubiKey YK-3 (U8)
+    canary: [canary@legatto.pl]              # two keys: canary server + offline backup canary-b (same principal)
   signatures_required_default: 1             # D6(a); policy.json may raise it, never lower below 1
 legatto_release_layout:                      # relative to legatto_update_base_url
   index: index.json
@@ -460,8 +451,11 @@ legatto_index_validity_days: 35
 legatto_min_delay_hours:
   feature: {early: 24, stable: 48}
   security: {early: 2, stable: 4}
-legatto_update_timer_interval: 6h
-legatto_update_timer_jitter: 30min
+# legatto-update.timer per channel: how often the server checks the index. The
+# canary installs every valid release, so it checks most often; delays above
+# still count from first-seen, a shorter interval only notices documents sooner.
+legatto_update_timer_interval: {canary: 15min, early: 1h, stable: 1h}
+legatto_update_timer_jitter: {canary: 3min, early: 10min, stable: 10min}
 legatto_update_health_timeout_seconds: 180
 legatto_update_keep_releases: 2
 legatto_update_clock_jump_block_minutes: 60
@@ -489,6 +483,7 @@ legatto_breakglass:
   bootstrap_hours: 6
   reason_min_chars: 10
   reason_max_chars: 500
+  shorten_min_minutes: 2                     # `shorten`: earliest new end is now + 2 min; never extends
   reconcile_interval: minutely
   fw_confirm_timeout_seconds: 120
   nft_sets: {vendor4: vendor4, vendor6: vendor6, window4: bg4, window6: bg6}
@@ -526,14 +521,16 @@ legatto_roles:
 # --- Ansible run gate (vendor tooling: plan -> accept -> apply, one office at a time) ------
 legatto_play_serial: 1
 legatto_play_max_fail_percentage: 0
-legatto_playbooks: [bootstrap, service, restore-test]
+# bootstrap = installation phase A (no office), handover = phase B with the office (P7, seal)
+legatto_playbooks: [bootstrap, handover, service, restore-test]
 legatto_plan_max_age_hours: 4               # deploy refuses older plans
 # Run inputs passed by scripts/deploy.sh as extra vars (not defined here):
 #   legatto_deploy: {operator, commit, offices_commit, playbook, mode: check|apply,
 #                    plan_sha256, diff_sha256, plan_created_at}   (last three: apply only)
 #   legatto_plan_sha256                (apply only)
 #   legatto_restore_test_report        (restore-test apply only; local path of the JSON report)
-#   legatto_update_bootstrap_bundle    (optional; controller path of a release mirror)
+#   legatto_update_bootstrap           (bootstrap play: first installation from legatto_update_base_url)
+#   legatto_update_bootstrap_bundle    (legatto_env test only; controller path of a release mirror)
 legatto_deploy_modes: [check, apply]
 # Paths inside legatto-offices that do not count as a dirty tree for plan/apply.
 legatto_offices_untracked_ok: [plans/, reports/]

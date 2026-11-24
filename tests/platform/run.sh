@@ -2,7 +2,7 @@
 # Tests of the platform lane in legatto-node: the release bundle (bundle/compose:
 # unchanged upstream Supabase copy + docker-compose.legatto.yml, bundle/env templates,
 # bundle/systemd units, bundle/caddy/sites.d) and the host tools legatto-secrets,
-# -acme, -stack, -studio (sbin/). `docker compose config` of upstream + override with
+# -acme, -stack (sbin/). `docker compose config` of upstream + override with
 # env files rendered by legatto-secrets, the updater's compose/unit/caddy-site
 # validators, `# contract:` constants against contract/contract.yml and
 # `systemd-analyze verify` of the release units.
@@ -54,7 +54,7 @@ yq -o=json '.' "$repo/contract/versions.yml" >"$work/versions.json"
 log "test image (Ubuntu 24.04, linux/amd64)"
 docker build --platform linux/amd64 -q -t "$image" "$here" >/dev/null
 
-log "root tests in the test image (secrets, acme, stack, studio, release units)"
+log "root tests in the test image (secrets, acme, stack, release units)"
 docker run --rm --platform linux/amd64 \
 	--cap-add NET_ADMIN \
 	--sysctl net.ipv6.conf.all.disable_ipv6=0 \

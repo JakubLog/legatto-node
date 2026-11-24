@@ -1,0 +1,16 @@
+{
+  "canary": "canary-legatto",
+  "failed_checks": [
+    "update.health",
+    "egress.selftest"
+  ],
+  "finished_at": "2026-11-21T11:40:00Z",
+  "installed_at": "2026-11-21T11:02:00Z",
+  "manifest_sha256": "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa",
+  "product": "legatto",
+  "result": "FAIL",
+  "schema": "legatto-canary/1",
+  "sequence": 12,
+  "verify_report_sha256": "dddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddd",
+  "version": "1.5.0"
+}

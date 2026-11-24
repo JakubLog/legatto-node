@@ -11,12 +11,14 @@ Three independent mechanisms end a window:
 Subcommands:
   enable --hours N --reason T --actor J     open a window
   disable [--reason T] --actor J            close it now
+  shorten --minutes N [--reason T] --actor J
+                                            end the open window earlier (never later)
   reconcile [--sets-only]                   expiry, vendor sets, drift repair
   status [--json]                           breakglass.json
   summary --window ID [--json]              what happened in a window
 
 Exit codes: 0 OK, 1 error, 2 bad arguments, 3 lock busy, 4 precondition,
-20 window already active (enable) / not active (disable),
+20 window already active (enable) / not active (disable, shorten),
 21 policy assertion failed (nft sets cut the vendor regardless; breakglass.error).
 """
 
@@ -42,6 +44,8 @@ HOURS_MIN = 1  # contract: legatto_breakglass.hours_min
 HOURS_MAX = 8  # contract: legatto_breakglass.hours_max
 REASON_MIN = 10  # contract: legatto_breakglass.reason_min_chars
 REASON_MAX = 500  # contract: legatto_breakglass.reason_max_chars
+SHORTEN_MIN_MINUTES = 2  # contract: legatto_breakglass.shorten_min_minutes
+SHORTEN_MAX_MINUTES = HOURS_MAX * 60
 STATE = os.path.join(ln.BREAKGLASS_DIR, "state.json")
 VENDOR_CACHE = os.path.join(ln.BREAKGLASS_DIR, "vendors.json")
 # included by /etc/nftables.conf (`include ".../breakglass/nft/*.nft"`)
@@ -474,6 +478,50 @@ def cmd_disable(args: argparse.Namespace) -> tuple:
         return close_window(state, actor, reason, "disabled")
 
 
+def cmd_shorten(args: argparse.Namespace) -> tuple:
+    """Move the end of the open window closer; never later than it already is.
+
+    The new end is min(expires_at, now + N minutes). The nft window sets get the
+    new timeout in the same transaction as always, so the kernel cut and the
+    reconcile timer both follow the shorter window.
+    """
+    ln.require_root()
+    actor = ln.parse_actor(args.actor)
+    if not SHORTEN_MIN_MINUTES <= args.minutes <= SHORTEN_MAX_MINUTES:
+        raise ln.ToolError(f"--minutes must be {SHORTEN_MIN_MINUTES}-{SHORTEN_MAX_MINUTES}", ln.EXIT_ARGS)
+    reason = validate_reason(args.reason or "", 0)
+    with ln.FileLock(LOCK):
+        state = load_state()
+        if not state.get("active") or window_expired(state):
+            return EXIT_STATE, {"error": "no active window", **status_doc(state)}
+        before = state["expires_at"]
+        target = ln.now() + ln.minutes(args.minutes)
+        out = {"window_id": state["window_id"], "expires_at_before": before, "changed": False}
+        if target >= ln.parse_ts(before):
+            return ln.EXIT_OK, {**out, "expires_at": before, "window_seconds": seconds_left(state)}
+        state["expires_at"] = ln.fmt_ts(target)
+        # The audit entry comes first, as for enable: no change without a trace.
+        ln.audit("breakglass", "breakglass.shorten", actor, {
+            "window_id": state["window_id"], "minutes": args.minutes, "reason": reason,
+            "expires_at_before": before, "expires_at": state["expires_at"]})
+        save_state(state)
+        window_seconds = seconds_left(state)
+        v4, v6, _fresh = vendor_addresses()
+        errors = []
+        try:
+            apply_sets(v4, v6, window_seconds)
+        except ln.ToolError as exc:
+            # The state already holds the shorter end: the reconcile timer closes on time.
+            errors.append(f"nft: {exc}")
+            state["last_error"] = f"shorten nft: {exc}"[:500]
+            ln.audit_best_effort("breakglass", "breakglass.error", SYSTEM_ACTOR, {
+                "window_id": state["window_id"], "stage": "shorten", "errors": state["last_error"]})
+            save_state(state)
+        publish_status(state, ok=not errors)
+        out.update({"expires_at": state["expires_at"], "changed": True, "window_seconds": window_seconds})
+        return (EXIT_ASSERT if errors else ln.EXIT_OK), out
+
+
 def reconcile(state: dict, sets_only: bool) -> tuple:
     if state.get("active") and window_expired(state) and not sets_only:
         code, out = close_window(state, SYSTEM_ACTOR, "window expired", "expired")
@@ -555,6 +603,11 @@ def build_parser() -> argparse.ArgumentParser:
     p.add_argument("--reason", default="")
     p.add_argument("--actor", required=True)
     p.add_argument("--json", action="store_true")
+    p = sub.add_parser("shorten")
+    p.add_argument("--minutes", type=int, required=True)
+    p.add_argument("--reason", default="")
+    p.add_argument("--actor", required=True)
+    p.add_argument("--json", action="store_true")
     p = sub.add_parser("reconcile")
     p.add_argument("--sets-only", action="store_true")
     p.add_argument("--json", action="store_true")
@@ -571,7 +624,7 @@ def main(argv: list) -> int:
         args = build_parser().parse_args(argv)
     except SystemExit as exc:
         return ln.EXIT_ARGS if exc.code else ln.EXIT_OK
-    handlers = {"enable": cmd_enable, "disable": cmd_disable, "reconcile": cmd_reconcile,
+    handlers = {"enable": cmd_enable, "disable": cmd_disable, "shorten": cmd_shorten, "reconcile": cmd_reconcile,
                 "status": cmd_status, "summary": cmd_summary}
     try:
         code, result = handlers[args.cmd](args)

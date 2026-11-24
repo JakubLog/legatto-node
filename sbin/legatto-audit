@@ -55,7 +55,7 @@ GENESIS_PREV = "0" * 64  # contract: legatto_audit.genesis_prev
 FIELDS = ("seq", "ts", "host", "cat", "event", "actor", "node", "params", "prev", "hash")  # contract: legatto_audit.fields
 CATEGORIES = (  # contract: legatto_audit.categories
     "ansible", "breakglass", "ssh", "sudo", "admin", "fw", "update", "console", "egress",
-    "backup", "intake", "publish", "studio", "device",
+    "backup", "intake", "publish", "device",
 )
 ACTOR_KINDS = ("office-admin", "vendor", "system", "bootstrap")
 VENDOR_RE = re.compile(r"^v-[a-z][a-z0-9-]{1,20}$")  # contract: legatto_vendor_login_regex

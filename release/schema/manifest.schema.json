@@ -75,14 +75,14 @@
       }
     },
     "source": {
+      "description": "Everything the bundle is built from: the legatto-node commit (bundle, egress, Worker, contract, release notes, app.lock) and the legatto-app release it pins.",
       "type": "object",
       "additionalProperties": false,
-      "required": ["infra", "node", "app"],
+      "required": ["node", "app"],
       "properties": {
-        "infra": { "$ref": "#/$defs/git_source" },
         "node": { "$ref": "#/$defs/git_source" },
         "app": {
-          "description": "legatto-app release pinned by hash in a signed legatto-infra commit (R6).",
+          "description": "legatto-app release pinned by hash in release/app.lock of the legatto-node commit (R6).",
           "type": "object",
           "additionalProperties": false,
           "required": ["repo", "commit", "version", "release_sha256"],

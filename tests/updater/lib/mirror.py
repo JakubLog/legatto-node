@@ -168,7 +168,7 @@ class Release:
     """One release bundle. Fields may be changed before build() to build bad releases."""
 
     def __init__(self, version: str, sequence: int, typ="security", migrations=("20261101000000_init.sql",),
-                 prev_migration=None, with_caddy=True, with_worker=False):
+                 prev_migration=None, with_caddy=True, with_worker=False, image_from=None):
         self.version = version
         self.sequence = sequence
         self.type = typ
@@ -182,6 +182,7 @@ class Release:
         self.unlisted_config = {}         # path -> bytes in the tar but not in files[]
         self.manifest_patch = {}          # top-level overrides
         self.image_digest_override = None
+        self.image_from = image_from      # version whose app image archive is shipped unchanged
         self.tamper_after_sign = None     # name of an artifact whose bytes change after signing
         self.manifest_bytes = None
         self.manifest_sha = None
@@ -211,7 +212,8 @@ class Release:
     def build(self, mirror, signers=("release-a",), namespace="legatto-release") -> str:
         out = os.path.join(mirror.root, "releases", self.version)
         os.makedirs(out, exist_ok=True)
-        image_bytes, digest = oci_image("docker.io/legatto/app:%s" % self.version, self.version)
+        image_version = self.image_from or self.version
+        image_bytes, digest = oci_image("docker.io/legatto/app:%s" % image_version, image_version)
         self.app_digest = digest
         arts = []
 
@@ -264,8 +266,7 @@ class Release:
             "changelog_url": "https://github.com/JakubLog/legatto-infra/releases/tag/v%s" % self.version,
             "advisories": ([{"id": "LEGATTO-2026-001", "severity": "high", "summary": "Test advisory"}]
                            if self.type == "security" else []),
-            "source": {"infra": {"repo": "github.com/JakubLog/legatto-infra", "commit": "a" * 40},
-                       "node": {"repo": "github.com/JakubLog/legatto-node", "commit": "d" * 40},
+            "source": {"node": {"repo": "github.com/JakubLog/legatto-node", "commit": "d" * 40},
                        "app": {"repo": "github.com/JakubLog/legatto", "commit": "b" * 40,
                                "version": self.version, "release_sha256": "c" * 64}},
             "artifacts": arts,

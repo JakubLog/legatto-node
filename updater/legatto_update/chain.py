@@ -12,8 +12,9 @@ import os
 import zoneinfo
 
 from . import bundle, const, schema, sshsig
-from .host import CommandError, fmt_ts, parse_semver, parse_ts, read_bytes, rmtree, semver_gt, sha256_bytes
-from .source import DirSource, FetchError, SizeError
+from .host import (CommandError, fmt_ts, parse_semver, parse_ts, read_bytes, rmtree, semver_gt, sha256_bytes,
+                   sha256_file)
+from .source import DirSource, FetchError, SizeError, copy_file
 
 class PolicyError(Exception):
     pass
@@ -245,7 +246,9 @@ class Chain:
         ev["index"] = index
         inst = self.installed()
         self._installed_yanked(index, inst)
-        for entry in sorted(index["releases"], key=lambda r: r["sequence"]):
+        # Bootstrap installs one release: the newest installable one. Walking from the
+        # newest and stopping at the first ready release downloads one bundle, not all.
+        for entry in sorted(index["releases"], key=lambda r: r["sequence"], reverse=bootstrap):
             if entry["yanked"]:
                 continue
             cand = self._classify(entry, inst)
@@ -256,6 +259,9 @@ class Chain:
             else:
                 ev["rejected"] = True
             ev["candidates"].append(cand)
+            if bootstrap and cand["state"] == "ready":
+                break
+        ev["candidates"].sort(key=lambda c: c["sequence"])
         ready = [c for c in ev["candidates"] if c["state"] == "ready"]
         if ready:
             ev["chosen"] = max(ready, key=lambda c: c["sequence"])
@@ -467,6 +473,11 @@ class Chain:
                                    "egress_widening": bool(cand["egress"] and cand["egress"].get("widening"))},
                        "pending:%s" % sha)
             return cand
+        # "Install now" (approve --install-now) skips only the install window: promotion,
+        # channel delay, approval and egress gates above are already satisfied here.
+        if approval and approval.get("install_now"):
+            cand["state"] = "ready"
+            return cand
         not_before = parse_ts(approval["not_before"]) if approval and approval.get("not_before") else None
         start = max(self.now, not_before or self.now)
         if (not_before and not_before > self.now) or not self.in_window(self.now):
@@ -586,14 +597,58 @@ class Chain:
         if total > self.policy["max_bundle_bytes"]:
             raise SizeError("bundle %d bytes above max_bundle_bytes" % total)
         art_dir = self.artifact_dir(version)
+        local = None
         for a in manifest["artifacts"]:
             path = os.path.join(art_dir, a["name"])
             if os.path.isfile(path) and os.path.getsize(path) == a["size"]:
+                continue
+            if local is None:
+                local = self._local_artifacts(version)
+            if self._reuse(local.get(a["sha256"]), path, a):
                 continue
             if remote is None:
                 raise FetchError("%s not downloaded" % a["name"])
             remote.download(rel_release(version, a["name"]), path, a["size"])
         return bundle.check_artifact_files(manifest, art_dir)
+
+    def _local_artifacts(self, version: str) -> dict:
+        """sha256 -> path of artifact files already on disk: kept releases
+        (releases/<v>/artifacts) and downloads of other candidates. The listing comes
+        from their manifests; _reuse() re-hashes a file before using it."""
+        dirs = []
+        kept = self.host.p(const.RELEASES)
+        if os.path.isdir(kept):
+            dirs += [os.path.join(kept, n) for n in sorted(os.listdir(kept)) if not n.startswith(".")]
+        downloads = os.path.join(self.dl, "releases")
+        if os.path.isdir(downloads):
+            dirs += [os.path.join(downloads, n) for n in sorted(os.listdir(downloads)) if n != version]
+        found = {}
+        for d in dirs:
+            data = read_bytes(os.path.join(d, "manifest.json"))
+            try:
+                arts = json.loads(data.decode("utf-8"))["artifacts"] if data else []
+                for a in arts:
+                    path = os.path.join(d, "artifacts", a["name"])
+                    if a["sha256"] not in found and os.path.isfile(path) and os.path.getsize(path) == a["size"]:
+                        found[a["sha256"]] = path
+            except (ValueError, KeyError, TypeError, AttributeError, UnicodeDecodeError):
+                continue
+        return found
+
+    def _reuse(self, src, dest: str, a: dict) -> bool:
+        """Hard link (or copy) an identical local file instead of downloading it."""
+        if src is None:
+            return False
+        rmtree(dest)
+        try:
+            copy_file(src, dest)
+        except OSError:
+            rmtree(dest)
+            return False
+        if os.path.getsize(dest) == a["size"] and sha256_file(dest) == a["sha256"]:
+            return True
+        rmtree(dest)
+        return False
 
     # --- install window ---------------------------------------------------------------------
     def _tz(self):

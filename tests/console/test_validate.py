@@ -14,13 +14,14 @@ VALID = {
     "breakglass.enable": [{"hours": 1, "reason": "Aktualizacja systemu"}, {"hours": 8, "reason": "x" * 500}],
     "breakglass.disable": [{}, {"reason": ""}, {"reason": "Koniec prac"}],
     "update.approve": [{"release": "1.5.0", "manifest_sha256": SHA},
-                       {"release": "1.5.0-rc.1", "manifest_sha256": SHA, "not_before": "2026-11-22T22:00:00Z"}],
+                       {"release": "1.5.0-rc.1", "manifest_sha256": SHA, "not_before": "2026-11-22T22:00:00Z"},
+                       {"release": "1.5.0", "manifest_sha256": SHA, "install_now": True},
+                       {"release": "1.5.0", "manifest_sha256": SHA, "install_now": False,
+                        "not_before": "2026-11-22T22:00:00Z"}],
     "update.reject": [{"release": "1.5.0", "manifest_sha256": SHA}, {"release": "2.0.0", "manifest_sha256": SHA,
                                                                      "reason": "Nie teraz"}],
     "update.rollback": [{}, {"to": "1.4.2"}],
     "update.autosecurity": [{"enabled": True}, {"enabled": False}],
-    "studio.enable": [{"hours": 1}, {"hours": 8}],
-    "studio.disable": [{}],
     "device.enroll": [{"kind": "office-device"}, {"kind": "staff", "login": "anna.nowak"}],
     "device.revoke": [{"node_id": "12"}],
     "staff.set": [{"staff": []}, {"staff": ["anna.nowak", "jan-kowalski", "ab"]}],
@@ -48,13 +49,15 @@ INVALID = {
     "update.approve": [{"release": "1.5", "manifest_sha256": SHA}, {"release": "1.5.0", "manifest_sha256": SHA.upper()},
                        {"release": "1.5.0", "manifest_sha256": SHA, "not_before": "2026-11-22 22:00"},
                        {"release": "1.5.0", "manifest_sha256": SHA, "not_before": "2026-13-40T22:00:00Z"},
-                       {"release": "01.5.0", "manifest_sha256": SHA}, {"release": "1.5.0"}],
+                       {"release": "01.5.0", "manifest_sha256": SHA}, {"release": "1.5.0"},
+                       {"release": "1.5.0", "manifest_sha256": SHA, "install_now": "true"},
+                       {"release": "1.5.0", "manifest_sha256": SHA, "install_now": 1},
+                       {"release": "1.5.0", "manifest_sha256": SHA, "install_now": True,
+                        "not_before": "2026-11-22T22:00:00Z"}],
     "update.reject": [{"release": "1.5.0", "manifest_sha256": "abc"}, {"release": "1.5.0", "manifest_sha256": SHA,
                                                                         "reason": "x" * 501}],
     "update.rollback": [{"to": "latest"}, {"to": ""}, {"version": "1.0.0"}],
     "update.autosecurity": [{"enabled": "true"}, {"enabled": 1}, {}],
-    "studio.enable": [{"hours": 0}, {"hours": 9}, {}],
-    "studio.disable": [{"hours": 1}],
     "device.enroll": [{"kind": "vendor"}, {"kind": "staff"}, {"kind": "office-device", "login": "anna"},
                       {"kind": "staff", "login": "Anna"}, {"kind": "staff", "login": "a"}],
     "device.revoke": [{"node_id": 12}, {"node_id": "0"}, {"node_id": "1; rm"}, {}],
@@ -108,11 +111,15 @@ class RequestTypes(unittest.TestCase):
         with self.assertRaises(Invalid):
             validate.params_for("system.shell", {})
         with self.assertRaises(Invalid):
-            validate.params_for("studio.disable", [])
+            validate.params_for("recovery.generate", [])
 
     def test_normalisation(self):
         self.assertEqual(validate.params_for("staff.set", {"staff": ["b.b", "a.a"]}), {"staff": ["a.a", "b.b"]})
         self.assertEqual(validate.params_for("breakglass.disable", {}), {"reason": ""})
+        approve = {"release": "1.5.0", "manifest_sha256": SHA}
+        self.assertEqual(validate.params_for("update.approve", {**approve, "install_now": True}),
+                         {**approve, "install_now": True})
+        self.assertEqual(validate.params_for("update.approve", {**approve, "install_now": False}), approve)
 
 
 class Envelope(unittest.TestCase):
@@ -140,12 +147,12 @@ class Envelope(unittest.TestCase):
                 validate.actor(actor)
 
     def test_auth(self):
-        self.assertEqual(validate.auth({"method": "local-totp", "totp": "012345"}, "studio.disable")["totp"], "012345")
+        self.assertEqual(validate.auth({"method": "local-totp", "totp": "012345"}, "breakglass.disable")["totp"], "012345")
         for auth in ({"method": "local-totp", "totp": "12345"}, {"method": "local-totp", "totp": 123456},
                      {"method": "password", "totp": "123456"}, {"method": "local-totp"}, None,
                      {"method": "setup-code", "code": "AAAA-BBBB-CCCC-DDDD"}):
             with self.assertRaises(Invalid):
-                validate.auth(auth, "studio.disable")
+                validate.auth(auth, "breakglass.disable")
         validate.auth({"method": "setup-code", "code": "AAAA-BBBB-CCCC-DDDD"}, "console.setup")
         for auth in ({"method": "local-totp", "totp": "123456"}, {"method": "setup-code", "code": "aaaa-bbbb"}):
             with self.assertRaises(Invalid):

@@ -1,17 +1,41 @@
 # Release trust anchors of production office servers (legatto_env: prod).
 # Installed to /etc/legatto/update/allowed_signers by the `updater` role,
 # only inside a break-glass window; a release can never change this file.
+# Adding a key later costs a break-glass window in every office, so all four
+# keys below are added before the first office (RUNBOOK §0.2, §0.6).
 #
-# Format (ssh-keygen(1) ALLOWED SIGNERS), one key per line:
+# Format (ssh-keygen(1) ALLOWED SIGNERS), one key per line, no trailing comment;
+# the "# <name>:" line above each key names it:
+#   # release-a: YubiKey YK-2 (releases only)
 #   release-a@legatto.pl namespaces="legatto-release,legatto-promote,legatto-index,legatto-revoke" sk-ssh-ed25519@openssh.com AAAA...
+#   # release-b: YubiKey YK-3 (offline backup)
 #   release-b@legatto.pl namespaces="legatto-release,legatto-promote,legatto-index,legatto-revoke" sk-ssh-ed25519@openssh.com AAAA...
+#   # canary: generated on the canary server
+#   canary@legatto.pl namespaces="legatto-canary" ssh-ed25519 AAAA...
+#   # canary-b: offline backup attestation key
 #   canary@legatto.pl namespaces="legatto-canary" ssh-ed25519 AAAA...
 #
-# release-a: the release YubiKey (FIDO2, resident, verify-required). Public
-#   half: `ssh-keygen -K` on the signing machine, then the .pub of id_ed25519_sk_rk.
-# release-b: offline backup key (U8); added when it is bought.
-# canary: printed by the `updater` role on the canary server
-#   ("Show the allowed_signers line of this canary server").
+# release-a: FIDO2 key on the release YubiKey (YK-2), resident, verify-required,
+#   application ssh:legatto-release; signs releases, promotions, the index and
+#   KRLs. YK-2 holds nothing else (no SSH login, no age identity).
+# release-b: the same kind of key on the offline YubiKey (YK-3), kept apart
+#   from YK-2 with its PIN stored separately; used when YK-2 is lost or
+#   broken. With signatures_required 1 either release key is enough.
+# canary: software ed25519 key of the permanent canary server (P14), created
+#   by the `updater` role, which prints this line ("Show the allowed_signers
+#   line of this canary server"). Signs only attestations (legatto-canary);
+#   it can never install or promote a release by itself.
+# canary-b: software ed25519 key generated offline on day 0, private half kept
+#   only age-encrypted to the YK-1 and YK-3 identities. Installed on a
+#   replacement canary server before its `updater` role runs, so a new canary
+#   needs no window in the offices. Same principal as `canary`: the updater
+#   signs and verifies attestations as canary@legatto.pl; the key is the only
+#   difference.
+#
+# Public halves: `ssh-keygen -K` with the YubiKey attached writes the resident
+# key handles (id_ed25519_sk_rk_legatto-release*.pub); the software keys come
+# with their .pub. Never invent or copy a key from elsewhere: each line is
+# added by a reviewed, signed commit in legatto-node and pinned in legatto-infra.
 #
 # The role refuses legatto_env=prod until this file lists at least
 # signatures_required release principals, all of type sk-ssh-ed25519.

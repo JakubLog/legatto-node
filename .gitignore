@@ -9,6 +9,8 @@ recovery-pack/
 node_modules/
 .wrangler/
 dist/
+# release bundles, image archive cache and build work dirs (release/build.sh)
+release/out/
 # unmodified upstream Supabase example env (vendored, public demo values)
 !bundle/compose/supabase/.env.example
 # python bytecode

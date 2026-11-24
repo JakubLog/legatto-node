@@ -84,7 +84,7 @@ class Env:
             "LEGATTO_OFFICE_TITLE=Biuro testowe", "LEGATTO_OFFICE_DOMAIN=example.test",
             "LEGATTO_HOST_SITE=example.test", "LEGATTO_HOST_VPN=vpn.example.test",
             "LEGATTO_HOST_CRM=app.example.test", "LEGATTO_HOST_ADMIN=admin.app.example.test",
-            "LEGATTO_HOST_STUDIO=studio.app.example.test", "LEGATTO_TS_IP4=100.64.0.1",
+            "LEGATTO_TS_IP4=100.64.0.1",
             "LEGATTO_TS_IP6=fd7a:115c:a1e0::1", "LEGATTO_PUBLIC_IPV4=192.0.2.10", "LEGATTO_TZ=Europe/Warsaw", ""]))
         self.write("/etc/legatto/update/allowed_signers", signers_file or allowed_signers(self.keys))
         self.write_policy()
@@ -741,6 +741,201 @@ class RollbackTests(Base):
     def test_rollback_without_previous(self):
         self.bootstrap()
         self.ok(self.e.run("rollback", actor=ADMIN), 4)
+
+
+# --- first installation from the update server (P3) ----------------------------------------------
+DOWNLOADS = "/var/lib/legatto/update/downloads/releases"
+
+
+class RemoteBootstrapTests(Base):
+    def test_bootstrap_downloads_from_update_server(self):
+        Release("1.0.0", 1, "feature").build(self.m)
+        self.next_release().build(self.m)
+        self.m.index(1)
+        res = self.ok(self.e.run("bootstrap", actor=BOOTSTRAP))
+        self.assertEqual(res["code"], "installed")
+        # canary installs every valid release: the newest one, and only its bundle is downloaded
+        self.assertEqual((self.e.installed(), self.e.current()), ("1.1.0", "1.1.0"))
+        self.assertFalse(os.path.exists(self.e.p(DOWNLOADS + "/1.0.0/artifacts")))
+        installed = [x for x in self.e.events() if x["event"] == "update.installed"][-1]
+        self.assertTrue(installed["params"]["bootstrap"])
+        self.assertEqual(installed["actor"], BOOTSTRAP)
+
+    def test_bundle_only_on_a_test_office(self):
+        Release("1.0.0", 1, "feature").build(self.m)
+        self.m.index(1)
+        self.e.policy.update({"env": "prod", "update_base_url": "https://updates.legatto.pl/v1"})
+        self.e.write_policy()
+        rc, res, err = self.e.run("bootstrap", "--bundle", self.e.bundle_copy(), actor=BOOTSTRAP)
+        self.assertEqual(rc, 4, err)
+        self.assertIn("env=test", res["message"])
+        self.assertFalse(os.path.exists(self.e.p("/opt/legatto/current")))
+
+    def test_unreachable_update_server(self):
+        self.e.policy["update_base_url"] = "http://127.0.0.1:9/v1"
+        self.e.write_policy()
+        res = self.ok(self.e.run("bootstrap", actor=BOOTSTRAP), 1)
+        self.assertEqual(res["code"], "fetch_failed")
+        self.assertFalse(os.path.exists(self.e.p("/opt/legatto/current")))
+
+
+class RemoteBootstrapStableTests(Base):
+    env_args = {"channel": "stable"}
+
+    def test_bootstrap_needs_the_channel_promotion(self):
+        Release("1.0.0", 1, "feature").build(self.m)
+        self.m.index(1)
+        res = self.ok(self.e.run("bootstrap", actor=BOOTSTRAP), 11)
+        self.assertEqual(res["code"], "nothing_installable")
+        self.assertIn("promocji", res["message"])
+        self.assertIsNone(self.e.status()["installed"]["version"])
+        self.m.attestation("1.0.0")
+        self.m.promote("1.0.0", "early")
+        self.m.promote("1.0.0", "stable")
+        self.next_release().build(self.m)  # newer, not promoted: never downloaded
+        self.m.index(2)
+        self.ok(self.e.run("bootstrap", actor=BOOTSTRAP))
+        self.assertEqual(self.e.installed(), "1.0.0")
+        self.assertFalse(os.path.exists(self.e.p(DOWNLOADS + "/1.1.0/artifacts")))
+
+
+# --- unchanged images are reused (V2) -------------------------------------------------------------
+class ImageReuseTests(Base):
+    KEPT = "/opt/legatto/releases/%s/artifacts/image-app.tar"
+
+    def loads(self):
+        return [c for c in self.e.calls("docker") if c[:1] == ["load"]]
+
+    def test_unchanged_image_is_neither_downloaded_nor_loaded(self):
+        self.bootstrap()
+        loads = len(self.loads())
+        kept = self.e.p(self.KEPT % "1.0.0")
+        self.assertTrue(os.path.isfile(kept))
+        self.next_release(image_from="1.0.0").build(self.m)
+        self.m.index(2)
+        self.ok(self.e.run("run"))
+        self.assertEqual(self.e.installed(), "1.1.0")
+        # hard link of the kept archive, no docker load
+        self.assertEqual(os.stat(self.e.p(self.KEPT % "1.1.0")).st_ino, os.stat(kept).st_ino)
+        self.assertEqual(len(self.loads()), loads)
+        # a changed image is downloaded and loaded
+        self.next_release("1.2.0", 3).build(self.m)
+        self.m.index(3)
+        self.ok(self.e.run("run"))
+        self.assertEqual(self.e.installed(), "1.2.0")
+        self.assertEqual(len(self.loads()), loads + 1)
+        self.assertNotEqual(os.stat(self.e.p(self.KEPT % "1.2.0")).st_ino,
+                            os.stat(self.e.p(self.KEPT % "1.1.0")).st_ino)
+        self.assertFalse(os.path.exists(kept))  # 1.0.0 pruned (keep_releases 2), its image still used by 1.1.0
+        self.assertIn("docker.io/legatto/app@" + self.m.releases["1.1.0"].app_digest,
+                      load(self.e.p("/fake/images.json")))
+
+    def test_modified_local_copy_is_downloaded_again(self):
+        self.bootstrap()
+        kept = self.e.p(self.KEPT % "1.0.0")
+        with open(kept, "r+b") as fh:
+            fh.seek(-1, os.SEEK_END)
+            last = fh.read(1)[0]
+            fh.seek(-1, os.SEEK_END)
+            fh.write(bytes([last ^ 1]))
+        self.next_release(image_from="1.0.0").build(self.m)
+        self.m.index(2)
+        self.ok(self.e.run("run"))
+        self.assertEqual(self.e.installed(), "1.1.0")
+        self.assertNotEqual(os.stat(self.e.p(self.KEPT % "1.1.0")).st_ino, os.stat(kept).st_ino)
+        self.assertEqual(self.e.status()["upd"], "ok")
+
+
+# --- "install now" (V3) ---------------------------------------------------------------------------
+def move_to_noon(e):
+    """Next day 12:00 Europe/Warsaw: outside an install window 02:00-05:00."""
+    import datetime
+    import zoneinfo
+    local = datetime.datetime.fromtimestamp(e.now, zoneinfo.ZoneInfo("Europe/Warsaw"))
+    noon = local.replace(hour=12, minute=0, second=0, microsecond=0)
+    e.advance(noon.timestamp() - e.now + 86400)
+    e.mirror.now = e.now
+
+
+class InstallNowTests(Base):
+    env_args = {"window": ("02:00", "05:00")}
+
+    def waiting_feature(self):
+        self.bootstrap()
+        move_to_noon(self.e)
+        r2 = self.next_release(typ="feature")
+        r2.build(self.m)
+        self.m.index(2, issued=self.e.now)
+        self.ok(self.e.run("run"))
+        self.assertEqual(self.e.status()["pending"][0]["state"], "waiting-approval")
+        return r2
+
+    def started(self):
+        return [c for c in self.e.calls("systemctl") if c[:2] == ["start", "--no-block"]]
+
+    def test_install_now_skips_the_window(self):
+        r2 = self.waiting_feature()
+        res = self.ok(self.e.run("approve", "--release", "1.1.0", "--manifest-sha256", r2.manifest_sha,
+                                 "--install-now", actor=ADMIN))
+        self.assertEqual(res["code"], "approved")
+        self.assertTrue(res["data"]["install_now"])
+        self.assertEqual(self.started(), [["start", "--no-block", "legatto-update.service"]])
+        self.assertTrue(self.e.pending("1.1.0")["approval"]["install_now"])
+        self.assertEqual(self.e.status()["pending"][0]["state"], "ready")
+        approved = [x for x in self.e.events() if x["event"] == "update.approved"][-1]
+        self.assertTrue(approved["params"]["install_now"])
+        self.ok(self.e.run("run"))
+        self.assertEqual(self.e.installed(), "1.1.0")
+
+    def test_plain_approval_waits_for_the_window(self):
+        r2 = self.waiting_feature()
+        res = self.ok(self.e.run("approve", "--release", "1.1.0", "--manifest-sha256", r2.manifest_sha,
+                                 actor=ADMIN))
+        self.assertNotIn("install_now", res["data"])
+        self.assertEqual(self.started(), [])
+        self.ok(self.e.run("run"))
+        self.assertEqual(self.e.status()["pending"][0]["state"], "waiting-window")
+        self.assertEqual(self.e.installed(), "1.0.0")
+
+    def test_install_now_excludes_not_before(self):
+        r2 = self.waiting_feature()
+        self.ok(self.e.run("approve", "--release", "1.1.0", "--manifest-sha256", r2.manifest_sha, "--install-now",
+                           "--not-before", "2026-11-22T22:00:00Z", actor=ADMIN), 2)
+        self.assertNotIn("update.approved", self.e.event_names())
+
+
+class InstallNowStableTests(Base):
+    env_args = {"channel": "stable", "window": ("02:00", "05:00")}
+
+    def test_install_now_keeps_promotion_and_channel_delay(self):
+        self.bootstrap(promote=True)
+        move_to_noon(self.e)
+        r2 = self.next_release(typ="feature")
+        r2.build(self.m)
+        self.m.index(2, issued=self.e.now)
+        self.ok(self.e.run("run"))
+        self.assertEqual(self.e.status()["pending"][0]["state"], "waiting-promotion")
+        res = self.ok(self.e.run("approve", "--release", "1.1.0", "--manifest-sha256", r2.manifest_sha,
+                                 "--install-now", actor=ADMIN))
+        self.assertIn("po promocji", res["message"])
+        self.ok(self.e.run("run"))
+        self.assertEqual((self.e.installed(), self.e.status()["pending"][0]["state"]), ("1.0.0", "waiting-promotion"))
+        self.m.attestation("1.1.0")
+        self.m.promote("1.1.0", "early")
+        self.m.promote("1.1.0", "stable")
+        self.m.index(3, issued=self.e.now)
+        self.ok(self.e.run("run"))
+        st = self.e.status()
+        self.assertEqual(st["pending"][0]["state"], "waiting-delay")
+        self.assertEqual(st["pending"][0]["earliest_install_at"], ts(self.e.now + 48 * HOUR))
+        self.e.advance(47 * HOUR)
+        self.ok(self.e.run("run"))
+        self.assertEqual(self.e.installed(), "1.0.0")
+        # delay over at 12:00, outside the window: the "install now" approval installs it
+        self.e.advance(HOUR + 60)
+        self.ok(self.e.run("run"))
+        self.assertEqual(self.e.installed(), "1.1.0")
+        self.assertEqual([c for c in self.e.calls("systemctl") if c[:2] == ["start", "--no-block"]], [])
 
 
 # --- misc -----------------------------------------------------------------------------------------

@@ -196,8 +196,6 @@ class Executor:
             "update.reject": self.h_update_reject,
             "update.rollback": self.h_update_rollback,
             "update.autosecurity": self.h_update_autosecurity,
-            "studio.enable": self.h_studio_enable,
-            "studio.disable": self.h_studio_disable,
             "device.enroll": self.h_device_enroll,
             "device.revoke": self.h_device_revoke,
             "staff.set": self.h_staff_set,
@@ -578,7 +576,8 @@ class Executor:
             if "ics_hosts" in params:
                 out["ics_hosts_count"] = len(params["ics_hosts"])
             return out
-        allowed = ("hours", "release", "manifest_sha256", "not_before", "to", "enabled", "kind", "node_id", "login")
+        allowed = ("hours", "release", "manifest_sha256", "not_before", "install_now", "to", "enabled", "kind",
+                   "node_id", "login")
         out = {k: params[k] for k in allowed if k in params}
         if rtype.startswith("breakglass.") and params.get("reason"):
             out["reason"] = params["reason"]  # allowed by CONTRACT §4.2
@@ -663,8 +662,15 @@ class Executor:
         args = ["approve", "--release", ctx.params["release"], "--manifest-sha256", ctx.params["manifest_sha256"]]
         if "not_before" in ctx.params:
             args += ["--not-before", ctx.params["not_before"]]
-        return self._update(ctx, args, "Zatwierdzenie wydania", "approved",
-                            f"Wydanie {ctx.params['release']} zatwierdzone; instalacja w najbliższym oknie.")
+        if ctx.params.get("install_now"):
+            # Skips only the night install window; channel delays, promotion and egress gates still apply.
+            # legatto-update starts its own run in the background; the result does not wait for the install.
+            args.append("--install-now")
+            message = (f"Wydanie {ctx.params['release']} zatwierdzone do instalacji teraz — bez czekania na okno "
+                       "nocne, ale nie wcześniej niż po obowiązkowym opóźnieniu kanału.")
+        else:
+            message = f"Wydanie {ctx.params['release']} zatwierdzone; instalacja w najbliższym oknie."
+        return self._update(ctx, args, "Zatwierdzenie wydania", "approved", message)
 
     def h_update_reject(self, ctx: Context) -> Outcome:
         args = ["reject", "--release", ctx.params["release"], "--manifest-sha256", ctx.params["manifest_sha256"]]
@@ -682,24 +688,6 @@ class Executor:
         return self._update(ctx, ["autosecurity", "--enabled", "true" if enabled else "false"],
                             "Zmiana automatycznych poprawek bezpieczeństwa", "autosecurity_set",
                             "Automatyczne poprawki bezpieczeństwa " + ("włączone." if enabled else "wyłączone."))
-
-    # --- handlers: Studio ----------------------------------------------------------------------------
-    def h_studio_enable(self, ctx: Context) -> Outcome:
-        rc, out, _ = self.run_tool(contract.CLI_STUDIO, ["enable", "--hours", str(ctx.params["hours"]),
-                                                         "--actor", ctx.actor_json])
-        if rc == 0:
-            studio = self.refresh_snapshot().get("studio", {}).get("data") or {}
-            until = self.local_time(studio.get("expires_at")) if studio.get("expires_at") else None
-            return Outcome("ok", "enabled", "Studio włączone" + (f" do {until}." if until else "."),
-                           data={"expires_at": studio.get("expires_at"), "url": studio.get("url")})
-        return self.generic_failure(rc, out, "Włączenie Studio")
-
-    def h_studio_disable(self, ctx: Context) -> Outcome:
-        rc, out, _ = self.run_tool(contract.CLI_STUDIO, ["disable", "--actor", ctx.actor_json])
-        if rc == 0:
-            self.refresh_snapshot()
-            return Outcome("ok", "disabled", "Studio wyłączone.")
-        return self.generic_failure(rc, out, "Wyłączenie Studio")
 
     # --- handlers: tailnet devices -------------------------------------------------------------------
     def h_device_enroll(self, ctx: Context) -> Outcome:
@@ -1027,12 +1015,6 @@ class Executor:
             keep = ("id", "name", "user", "tags", "ip4", "ip6", "online", "last_seen", "expiry")
             return {"items": [{k: n.get(k) for k in keep} for n in out["nodes"] if isinstance(n, dict)]}
 
-        def studio() -> dict:
-            rc, out, _ = self.run_tool(contract.CLI_STUDIO, ["status", "--json"], timeout=60)
-            if rc != 0 or not isinstance(out, dict):
-                raise Rejected("studio_failed", "studio")
-            return {"data": {k: out.get(k) for k in ("enabled", "running", "expires_at", "url", "actor")}}
-
         def staff() -> dict:
             doc = store.read_json(self.p(contract.STAFF_FILE))
             items = doc.get("staff") if isinstance(doc, dict) else doc if isinstance(doc, list) else None
@@ -1045,7 +1027,6 @@ class Executor:
             return {"items": sorted(x for x in items if isinstance(x, str))}
 
         section("nodes", nodes)
-        section("studio", studio)
         section("staff", staff)
         self.write_console_file(location, snapshot)
         return snapshot
@@ -1107,7 +1088,7 @@ def main(argv: list[str] | None = None) -> int:
     p_process = sub.add_parser("process", help="process requests in incoming/ (legatto-console-exec.service)")
     p_process.add_argument("--once", action="store_true", help="one pass over the files present now")
     sub.add_parser("prune", help="delete expired sensitive results, old archive entries and stale temp files")
-    sub.add_parser("snapshot", help="refresh snapshot.json (tailnet nodes, staff list, Studio) for the panel")
+    sub.add_parser("snapshot", help="refresh snapshot.json (tailnet nodes, staff list) for the panel")
     p_setup = sub.add_parser("setup-code", help="issue a one-time code for creating the first console account (P7)")
     p_setup.add_argument("--json", action="store_true")
     p_setup.add_argument("--actor", default=None)

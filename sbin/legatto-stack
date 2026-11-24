@@ -10,8 +10,7 @@ Subcommands:
   refresh                         `up` if legatto-stack.service is active and no update runs
                                   (after env files were re-rendered, e.g. feature flags changed)
   down                            `docker compose down` (volumes stay)
-  start SERVICE...                start optional services (meta, studio: profile admin)
-  stop SERVICE...                 stop and remove the containers of SERVICE (maintenance, studio)
+  stop SERVICE...                 stop and remove the containers of SERVICE (maintenance)
   status [--json]                 state and health of every expected service
   check --compose-dir D --templates T
                                   render T into a private temp dir, `docker compose config -q`
@@ -55,18 +54,13 @@ PII_KEY = "/run/legatto/keys/pii_field_key"
 SECRETS_DIR = "/etc/legatto/secrets"
 # contract: legatto_paths.office_env
 OFFICE_ENV = "/etc/legatto/office.env"
-# contract: legatto_paths.studio_state
-STUDIO_STATE = "/var/lib/legatto/studio.json"
 # contract: legatto_paths.sbin
 SBIN = "/opt/legatto/sbin"
 # contract: legatto_ip_host_net.app + legatto_ports.local.app_http
 APP_HTTP = ("172.30.0.10", 3000)
 # contract: legatto_compose_services
-SERVICES = ("db", "auth", "rest", "realtime", "storage", "functions", "api-gw", "app", "meta", "studio",
+SERVICES = ("db", "auth", "rest", "realtime", "storage", "functions", "api-gw", "app",
             "egress-app", "egress-auth", "egress-fn", "egress-intake", "egress-publish")
-# contract: legatto_compose_profile_admin
-PROFILE_ADMIN = "admin"
-ADMIN_SERVICES = ("meta", "studio")
 PROFILE_TOOLS = "tools"
 # contract: legatto_units.stack
 STACK_UNIT = "legatto-stack.service"
@@ -184,18 +178,6 @@ class Compose:
         return json.loads(self.run("config", "--format", "json", capture=True).stdout)
 
 
-def studio_enabled():
-    try:
-        with open(STUDIO_STATE, "r", encoding="utf-8") as fh:
-            state = json.load(fh)
-    except (FileNotFoundError, json.JSONDecodeError):
-        return False
-    expires = state.get("expires_at")
-    if not state.get("enabled") or not expires:
-        return False
-    return time.strftime("%Y-%m-%dT%H:%M:%SZ", time.gmtime()) < expires
-
-
 def docker(*args, capture=True, check=True):
     proc = subprocess.run(["docker"] + list(args), text=True,
                           stdout=subprocess.PIPE if capture else None,
@@ -238,8 +220,7 @@ def seed_pgsodium(compose):
 def stack_up(compose_dir):
     if not os.path.isfile(PII_KEY):
         raise Fail(4, PII_KEY + " missing (legatto-secrets render)")
-    profiles = [PROFILE_ADMIN] if studio_enabled() else []
-    compose = Compose(compose_dir, profiles=profiles)
+    compose = Compose(compose_dir)
     seed_pgsodium(compose)
     proc = compose.run("up", "--detach", "--remove-orphans", "--wait", "--wait-timeout", str(WAIT_TIMEOUT),
                        check=False)
@@ -274,7 +255,7 @@ def cmd_down(args):
     require_root()
     fd = take_lock(STACK_LOCK)
     try:
-        Compose(args.compose_dir, profiles=[PROFILE_ADMIN]).run("down", "--remove-orphans")
+        Compose(args.compose_dir).run("down", "--remove-orphans")
         return 0
     finally:
         os.close(fd)
@@ -286,26 +267,12 @@ def check_service_names(names, allowed):
         raise Fail(2, "unknown service(s): " + ", ".join(bad))
 
 
-def cmd_start(args):
-    require_root()
-    check_service_names(args.services, ADMIN_SERVICES)
-    fd = take_lock(STACK_LOCK)
-    try:
-        compose = Compose(args.compose_dir, profiles=[PROFILE_ADMIN])
-        proc = compose.run("up", "--detach", "--wait", "--wait-timeout", "300", *args.services, check=False)
-        if proc.returncode != 0:
-            raise Fail(43, "services did not become healthy: " + ", ".join(args.services))
-        return 0
-    finally:
-        os.close(fd)
-
-
 def cmd_stop(args):
     require_root()
     check_service_names(args.services, SERVICES)
     fd = take_lock(STACK_LOCK)
     try:
-        compose = Compose(args.compose_dir, profiles=[PROFILE_ADMIN])
+        compose = Compose(args.compose_dir)
         compose.run("stop", *args.services)
         compose.run("rm", "--force", "--stop", *args.services)
         return 0
@@ -323,8 +290,7 @@ def parse_ps(text):
 
 
 def collect_status(compose_dir):
-    profiles = [PROFILE_ADMIN] if studio_enabled() else []
-    compose = Compose(compose_dir, profiles=profiles)
+    compose = Compose(compose_dir)
     expected = [s for s in compose.run("config", "--services", capture=True).stdout.split() if s]
     rows = parse_ps(compose.run("ps", "--all", "--format", "json", capture=True).stdout)
     services = {}
@@ -381,7 +347,7 @@ def cmd_check(args):
             raise Fail(42, override + " still has @@LEGATTO_IMAGE@@ placeholders")
     with PrivateTmp() as tmp:
         render_into(args.templates, tmp)
-        compose = Compose(args.compose_dir, env_dir=tmp, profiles=[PROFILE_ADMIN, PROFILE_TOOLS])
+        compose = Compose(args.compose_dir, env_dir=tmp, profiles=[PROFILE_TOOLS])
         proc = compose.run("config", "--quiet", capture=True, check=False)
         if proc.returncode != 0:
             for line in proc.stderr.strip().splitlines()[-5:]:
@@ -487,8 +453,6 @@ def main(argv=None):
     with_dir(sub.add_parser("up"))
     with_dir(sub.add_parser("refresh"))
     with_dir(sub.add_parser("down"))
-    p = with_dir(sub.add_parser("start"))
-    p.add_argument("services", nargs="+")
     p = with_dir(sub.add_parser("stop"))
     p.add_argument("services", nargs="+")
     p = with_dir(sub.add_parser("status"))
@@ -509,7 +473,7 @@ def main(argv=None):
         args = parser.parse_args(argv)
     except SystemExit as exc:
         return 2 if exc.code else 0
-    handlers = {"up": cmd_up, "refresh": cmd_refresh, "down": cmd_down, "start": cmd_start, "stop": cmd_stop,
+    handlers = {"up": cmd_up, "refresh": cmd_refresh, "down": cmd_down, "stop": cmd_stop,
                 "status": cmd_status, "check": cmd_check, "migrate": cmd_migrate, "cron": cmd_cron,
                 "probe": cmd_probe}
     try:

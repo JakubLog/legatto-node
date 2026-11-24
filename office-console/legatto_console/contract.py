@@ -54,7 +54,6 @@ AUDIT_GROUP = "legatto-audit"  # contract: legatto_groups.audit
 CLI_AUDIT = "legatto-audit"  # contract: legatto_cli.audit
 CLI_BREAKGLASS = "legatto-breakglass"  # contract: legatto_cli.breakglass
 CLI_UPDATE = "legatto-update"  # contract: legatto_cli.update
-CLI_STUDIO = "legatto-studio"  # contract: legatto_cli.studio
 CLI_TAILNET = "legatto-tailnet"  # contract: legatto_cli.tailnet
 CLI_EGRESS = "legatto-egress"  # contract: legatto_cli.egress
 CLI_RECOVERY_PACK = "legatto-recovery-pack"  # contract: legatto_cli.recovery_pack
@@ -73,8 +72,6 @@ REQUEST_TYPES = (  # contract: legatto_requests.types
     "update.reject",
     "update.rollback",
     "update.autosecurity",
-    "studio.enable",
-    "studio.disable",
     "device.enroll",
     "device.revoke",
     "staff.set",

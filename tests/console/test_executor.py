@@ -17,10 +17,10 @@ def listing(path):
 
 class SpoolRules(TreeCase):
     def test_valid_request_result_archive_audit(self):
-        req = self.tree.request("studio.disable", {})
+        req = self.tree.request("breakglass.disable", {})
         res = self.tree.run(req)
         self.assertEqual(res["status"], "ok", res)
-        self.assertEqual((res["v"], res["id"], res["type"], res["sensitive"]), (1, req["id"], "studio.disable", False))
+        self.assertEqual((res["v"], res["id"], res["type"], res["sensitive"]), (1, req["id"], "breakglass.disable", False))
         self.assertIsInstance(res["audit_seq"], int)
         results = self.tree.p(contract.REQUESTS_RESULTS)
         st = os.stat(os.path.join(results, req["id"] + ".json"))
@@ -36,7 +36,7 @@ class SpoolRules(TreeCase):
         self.assertEqual(entry["node"], "biuro-laptop")
         self.assertEqual(entry["params"]["status"], "ok")
         self.assertNotIn("auth", json.dumps(entry))
-        call = [c for c in self.tree.calls(contract.CLI_STUDIO) if c["argv"][0] == "disable"][-1]
+        call = [c for c in self.tree.calls(contract.CLI_BREAKGLASS) if c["argv"][0] == "disable"][-1]
         self.assertEqual(call["argv"][:2], ["disable", "--actor"])
         self.assertEqual(json.loads(call["argv"][2])["id"], "szef")
 
@@ -44,14 +44,14 @@ class SpoolRules(TreeCase):
         for delta in (-121, 121, -3600):
             with self.subTest(delta=delta):
                 self.tree.forget_step("szef")
-                res = self.tree.run(self.tree.request("studio.disable", {}, ts=self.tree.now() + delta))
+                res = self.tree.run(self.tree.request("breakglass.disable", {}, ts=self.tree.now() + delta))
                 self.assertEqual((res["status"], res["code"]), ("rejected", "stale"))
         self.tree.forget_step("szef")
-        res = self.tree.run(self.tree.request("studio.disable", {}, ts=self.tree.now() - 100))
+        res = self.tree.run(self.tree.request("breakglass.disable", {}, ts=self.tree.now() - 100))
         self.assertEqual(res["status"], "ok")
 
     def test_duplicate_id_rejected_without_touching_the_first_result(self):
-        req = self.tree.request("studio.disable", {})
+        req = self.tree.request("breakglass.disable", {})
         first = self.tree.run(req)
         archive_before = listing(self.tree.p(contract.REQUESTS_ARCHIVE))
         self.tree.forget_step("szef")
@@ -61,21 +61,21 @@ class SpoolRules(TreeCase):
         self.assertEqual(self.tree.result(req["id"]), first)
         self.assertEqual(listing(self.tree.p(contract.REQUESTS_ARCHIVE)), archive_before)
         self.assertEqual(self.tree.audit_entries()[-1]["params"]["code"], "duplicate_id")
-        self.assertEqual(len([c for c in self.tree.calls(contract.CLI_STUDIO) if c["argv"][0] == "disable"]), 1)
+        self.assertEqual(len([c for c in self.tree.calls(contract.CLI_BREAKGLASS) if c["argv"][0] == "disable"]), 1)
 
     def test_id_mismatch_and_bad_names(self):
-        req = self.tree.request("studio.disable", {})
+        req = self.tree.request("breakglass.disable", {})
         other = crypto.new_ulid()
         self.tree.drop(req, name=other + ".json")
         self.tree.ex.process(once=True)
         self.assertEqual(self.tree.result(other)["code"], "bad_id")
-        self.tree.drop(self.tree.request("studio.disable", {}), name="evil name.json")
+        self.tree.drop(self.tree.request("breakglass.disable", {}), name="evil name.json")
         self.tree.drop(b"{}", name="not-an-ulid.json")
         self.tree.ex.process(once=True)
         self.assertEqual(listing(self.tree.p(contract.REQUESTS_INCOMING)), [])
         self.assertTrue(any(n.startswith("invalid-") for n in listing(self.tree.p(contract.REQUESTS_ARCHIVE))))
         self.assertEqual(listing(self.tree.p(contract.REQUESTS_PROCESSING)), [])
-        self.assertEqual(self.tree.calls(contract.CLI_STUDIO), [])
+        self.assertEqual(self.tree.calls(contract.CLI_BREAKGLASS), [])
 
     def test_size_json_owner_link_checks(self):
         cases = []
@@ -84,7 +84,7 @@ class SpoolRules(TreeCase):
         cases.append((big, "too_large", None))
         rid = crypto.new_ulid()
         cases.append((b"{not json", "bad_json", rid))
-        cases.append((self.tree.request("studio.disable", {}), "bad_owner", 0))
+        cases.append((self.tree.request("breakglass.disable", {}), "bad_owner", 0))
         for payload, code, extra in cases:
             with self.subTest(code=code):
                 if code == "bad_json":
@@ -105,20 +105,20 @@ class SpoolRules(TreeCase):
         link_id = crypto.new_ulid()
         os.symlink(secret, os.path.join(self.tree.p(contract.REQUESTS_INCOMING), link_id + ".json"))
         hard_id = crypto.new_ulid()
-        hard_src = self.tree.drop(self.tree.request("studio.disable", {}, rid=hard_id))
+        hard_src = self.tree.drop(self.tree.request("breakglass.disable", {}, rid=hard_id))
         os.link(hard_src, self.tree.p("/hardlink-copy"))
         self.tree.ex.process(once=True)
         self.assertEqual(self.tree.result(link_id)["code"], "bad_file")
         self.assertEqual(self.tree.result(hard_id)["code"], "bad_file")
-        self.assertEqual(self.tree.calls(contract.CLI_STUDIO), [])
+        self.assertEqual(self.tree.calls(contract.CLI_BREAKGLASS), [])
 
     def test_unknown_or_disabled_user(self):
-        res = self.tree.run(self.tree.request("studio.disable", {}, user="nikt", totp="123456"))
+        res = self.tree.run(self.tree.request("breakglass.disable", {}, user="nikt", totp="123456"))
         self.assertEqual(res["code"], "unknown_user")
         doc = self.tree.ex.users_doc()
         doc["users"]["anna"]["enabled"] = False
         self.tree.ex.save_users(doc)
-        res = self.tree.run(self.tree.request("studio.disable", {}, user="anna"))
+        res = self.tree.run(self.tree.request("breakglass.disable", {}, user="anna"))
         self.assertEqual(res["code"], "unknown_user")
         entry = self.tree.audit_entries()[-2]
         self.assertEqual(entry["actor"]["kind"], "system")  # unknown login is not trusted as actor
@@ -160,7 +160,7 @@ class ConsoleUserPermissions(TreeCase):
 
     def test_spool_permissions(self):
         rid = crypto.new_ulid()
-        res = self.tree.run(self.tree.request("studio.disable", {}))
+        res = self.tree.run(self.tree.request("breakglass.disable", {}))
         p = self.tree.p
         probe = f"""
 def can(fn):
@@ -199,12 +199,12 @@ print(" ".join(f"{{k}}={{v}}" for k, v in sorted(out.items())))
 class Totp(TreeCase):
     def test_anti_replay_and_lockout(self):
         code = self.tree.totp("szef")
-        self.assertEqual(self.tree.run(self.tree.request("studio.disable", {}, totp=code))["status"], "ok")
-        replay = self.tree.run(self.tree.request("studio.disable", {}, totp=code))
+        self.assertEqual(self.tree.run(self.tree.request("breakglass.disable", {}, totp=code))["status"], "ok")
+        replay = self.tree.run(self.tree.request("breakglass.disable", {}, totp=code))
         self.assertEqual(replay["code"], "totp_replay")
-        older = self.tree.run(self.tree.request("studio.disable", {}, totp=self.tree.totp("szef", -1)))
+        older = self.tree.run(self.tree.request("breakglass.disable", {}, totp=self.tree.totp("szef", -1)))
         self.assertEqual(older["code"], "totp_replay")
-        newer = self.tree.run(self.tree.request("studio.disable", {}, totp=self.tree.totp("szef", 1)))
+        newer = self.tree.run(self.tree.request("breakglass.disable", {}, totp=self.tree.totp("szef", 1)))
         self.assertEqual(newer["status"], "ok")
         step_file = os.path.join(self.tree.p(contract.CONSOLE_AUTH), "szef.step")
         self.assertEqual(int(Path(step_file).read_text()), crypto.totp_step(self.tree.now()) + 1)
@@ -214,10 +214,10 @@ class Totp(TreeCase):
         good = self.tree.totp("szef")
         wrong = "000000" if good != "000000" else "111111"
         for _ in range(executor.TOTP_FAIL_LIMIT):
-            self.assertEqual(self.tree.run(self.tree.request("studio.disable", {}, totp=wrong))["code"], "bad_totp")
-        self.assertEqual(self.tree.run(self.tree.request("studio.disable", {}, totp=good))["code"], "totp_locked")
+            self.assertEqual(self.tree.run(self.tree.request("breakglass.disable", {}, totp=wrong))["code"], "bad_totp")
+        self.assertEqual(self.tree.run(self.tree.request("breakglass.disable", {}, totp=good))["code"], "totp_locked")
         self.tree.clock_offset = executor.TOTP_FAIL_WINDOW + 1
-        self.assertEqual(self.tree.run(self.tree.request("studio.disable", {}))["status"], "ok")
+        self.assertEqual(self.tree.run(self.tree.request("breakglass.disable", {}))["status"], "ok")
 
     def test_login_success_and_failure_are_audited(self):
         res = self.tree.run(self.tree.request("console.login", {}))
@@ -277,16 +277,28 @@ class Handlers(TreeCase):
         self.assertEqual((res["status"], res["code"]), ("rejected", "policy_forbids"))
         self.assertEqual(self.last_argv(contract.CLI_UPDATE)[:3], ["autosecurity", "--enabled", "true"])
 
-    def test_studio(self):
-        self.tree.fake(contract.CLI_STUDIO, {"status": {"rc": 0, "stdout": {
-            "v": 1, "enabled": True, "running": True, "expires_at": "2026-11-21T12:00:00Z",
-            "url": "https://studio.app.example.pl", "actor": None}}, "enable": {"rc": 0, "stdout": None}})
-        res = self.call("studio.enable", {"hours": 3})
-        self.assertEqual(res["status"], "ok")
-        self.assertEqual(res["data"]["url"], "https://studio.app.example.pl")
-        self.assertEqual(self.tree.calls(contract.CLI_STUDIO)[0]["argv"][:3], ["enable", "--hours", "3"])
-        snap = store.read_json(self.tree.p(contract.CONSOLE_SNAPSHOT))
-        self.assertTrue(snap["studio"]["data"]["enabled"])
+    def test_update_approve_install_now(self):
+        sha = "b" * 64
+        self.tree.fake(contract.CLI_UPDATE, {"approve": {"rc": 0, "stdout": {"ok": True, "code": "approved",
+                                                                              "data": {"install_now": True}}}})
+        res = self.call("update.approve", {"release": "1.6.0", "manifest_sha256": sha, "install_now": True})
+        self.assertEqual((res["status"], res["code"]), ("ok", "approved"))
+        self.assertIn("bez czekania na okno nocne", res["message"])
+        self.assertIn("opóźnieniu kanału", res["message"])
+        argv = self.last_argv(contract.CLI_UPDATE)
+        self.assertEqual(argv[:6], ["approve", "--release", "1.6.0", "--manifest-sha256", sha, "--install-now"])
+        self.assertNotIn("--not-before", argv)
+        self.assertTrue(self.tree.audit_entries()[-1]["params"]["install_now"])
+        # install_now false is the default path: no flag, the install waits for the night window
+        self.call("update.approve", {"release": "1.6.0", "manifest_sha256": sha, "install_now": False})
+        self.assertNotIn("--install-now", self.last_argv(contract.CLI_UPDATE))
+        calls = len(self.tree.calls(contract.CLI_UPDATE))
+        res = self.call("update.approve", {"release": "1.6.0", "manifest_sha256": sha, "install_now": True,
+                                           "not_before": "2026-11-22T22:00:00Z"})
+        self.assertEqual((res["status"], res["code"]), ("rejected", "bad_params"))
+        res = self.call("update.approve", {"release": "1.6.0", "manifest_sha256": sha, "install_now": "true"})
+        self.assertEqual((res["status"], res["code"]), ("rejected", "bad_params"))
+        self.assertEqual(len(self.tree.calls(contract.CLI_UPDATE)), calls)
 
     def test_devices_and_staff(self):
         self.tree.fake(contract.CLI_TAILNET, {
@@ -340,7 +352,7 @@ class Handlers(TreeCase):
         recovery = self.tree.p(contract.RECOVERY_DIR)
         self.assertTrue(os.path.exists(os.path.join(recovery, res["data"]["file"])))
         self.assertNotIn(res["data"]["password"], json.dumps(self.tree.audit_entries()))
-        plain = self.call("studio.disable", {})
+        plain = self.call("breakglass.disable", {})
         self.tree.ex.prune()
         self.assertIsNotNone(self.tree.result(res["id"]))
         self.tree.clock_offset = contract.SENSITIVE_RESULT_TTL_SECONDS - 30
@@ -368,11 +380,11 @@ class Handlers(TreeCase):
         for rc, status, code in ((2, "rejected", "bad_args"), (3, "error", "busy"), (4, "error", "precondition"),
                                  (1, "error", "tool_failed")):
             with self.subTest(rc=rc):
-                self.tree.fake(contract.CLI_STUDIO, {"disable": {"rc": rc, "stdout": None}})
-                res = self.call("studio.disable", {})
+                self.tree.fake(contract.CLI_BREAKGLASS, {"disable": {"rc": rc, "stdout": None}})
+                res = self.call("breakglass.disable", {})
                 self.assertEqual((res["status"], res["code"]), (status, code))
-        os.unlink(contract.tool(contract.CLI_STUDIO))
-        self.assertEqual(self.call("studio.disable", {})["code"], "tool_missing")
+        os.unlink(contract.tool(contract.CLI_BREAKGLASS))
+        self.assertEqual(self.call("breakglass.disable", {})["code"], "tool_missing")
 
     def test_contacts(self):
         person = {"name": "Anna Nowak", "email": "anna@example.pl", "phone": "+48 600 100 200"}

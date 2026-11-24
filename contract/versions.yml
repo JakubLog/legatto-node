@@ -103,7 +103,7 @@ legatto_docker_apt:
 
 # --- Container images (digest of the linux/amd64 manifest; index digest for reference) ---------
 # Supabase self-hosted v0.8.4 (tag self-hosted/v0.8.4, docker/docker-compose.yml).
-# imgproxy and supavisor are disabled (profile "disabled") and not pinned.
+# imgproxy, supavisor, studio and postgres-meta are disabled (profile "disabled") and not pinned.
 legatto_supabase_selfhosted_version: "0.8.4"
 # Vendored, unmodified copy of docker/ in bundle/compose/supabase/. tests/platform
 # compares the git tree hash of that directory with `tree`.
@@ -144,14 +144,6 @@ legatto_images:
     ref: docker.io/envoyproxy/envoy:v1.39.6
     digest: sha256:9d117c1fbb4432621ed14603bc6e8da4fdf4602e702cc4ef8f40d59b7766489e
     index_digest: sha256:1fde8efee875e4e4f6a39a90fe49d9338e1caacce5762034ef9fb4bbb9ad6aed
-  studio:
-    ref: docker.io/supabase/studio:2026.11.02-sha-a05e7ec
-    digest: sha256:0d02ffee2215d6a7f4976de139531bba73311e0f25b1700869cf0d1e90c16f5b
-    index_digest: sha256:727a7f37b15f4c76c44e0d765e6be231d8d71c67f2933b2df8c6cbcc9b04c5d0
-  meta:
-    ref: docker.io/supabase/postgres-meta:v0.100.0
-    digest: sha256:822227a8d12c109b24b8d8f1dae98a9c089a698b4586d35527dadf929e655136
-    index_digest: sha256:145325b7e39f8ef4931d6e8cfd3f6f4d655de09d72a2ccc96d9513542c2202bd
   # Base for the vendor-built egress proxy image (smokescreen binary above,
   # no upstream image exists).
   distroless_static:
@@ -172,7 +164,7 @@ legatto_egress_proxy_source:
   commit: 609eb8931420453daf5893509be0b25b21bd9edb
 
 # --- Vendor infrastructure (not on office servers) -----------------------------------------
-# Global Uptime Kuma on the vendor's monitoring host (vendor tooling, not in this repository).
+# Global Uptime Kuma on the vendor's monitoring VPS (vendor tooling, not in this repository).
 # Verified 2026-11-22: registry manifest (buildx imagetools) and Docker Hub tags API.
 legatto_vendor_images:
   uptime_kuma:

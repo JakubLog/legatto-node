@@ -1,0 +1,35 @@
+{
+  "expires": "2026-12-26T12:00:00Z",
+  "issued_at": "2026-11-21T12:00:00Z",
+  "krl_sha256": null,
+  "product": "legatto",
+  "releases": [
+    {
+      "attestation_sha256": "2222222222222222222222222222222222222222222222222222222222222222",
+      "manifest_sha256": "1111111111111111111111111111111111111111111111111111111111111111",
+      "promotions": {
+        "early": "3333333333333333333333333333333333333333333333333333333333333333",
+        "stable": "4444444444444444444444444444444444444444444444444444444444444444"
+      },
+      "sequence": 11,
+      "type": "feature",
+      "version": "1.4.0",
+      "yanked": false
+    },
+    {
+      "attestation_sha256": null,
+      "manifest_sha256": "5555555555555555555555555555555555555555555555555555555555555555",
+      "promotions": {
+        "early": null,
+        "stable": null
+      },
+      "sequence": 12,
+      "type": "security",
+      "version": "1.4.1",
+      "yanked": true,
+      "yanked_reason": "regresja migracji"
+    }
+  ],
+  "schema": "legatto-index/1",
+  "sequence": 41
+}

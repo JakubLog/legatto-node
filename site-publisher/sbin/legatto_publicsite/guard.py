@@ -2,7 +2,7 @@
 the network-less build and before anything is uploaded to Cloudflare Pages).
 
 The public site must not reveal where the office lives: no tailnet-only host
-names (vpn./app./admin.app./studio.app./tn.), no server addresses (public
+names (vpn./app./admin.app./tn.), no server addresses (public
 IPv4, tailnet IPv4/IPv6 or anything in the tailnet prefixes), no Supabase
 endpoints or keys, and nothing that would turn the static upload into Pages
 Functions. Findings name the file and the rule, never the matched text.
@@ -43,7 +43,6 @@ def office_rules(env: dict[str, str]) -> list[tuple[str, re.Pattern[bytes]]]:
         "host-vpn": env["LEGATTO_HOST_VPN"],
         "host-crm": env["LEGATTO_HOST_CRM"],
         "host-admin": env["LEGATTO_HOST_ADMIN"],
-        "host-studio": env["LEGATTO_HOST_STUDIO"],
         "host-magicdns": f"tn.{domain}",  # contract: legatto_magicdns_base_domain
     }
     rules: list[tuple[str, re.Pattern[bytes]]] = []

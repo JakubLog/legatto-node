@@ -139,6 +139,67 @@ class BreakglassTest(ToolTestCase):
                                            "--json").stdout)
         self.assertEqual(summary["close_reason"], "disabled")
 
+    def shorten(self, minutes: str, actor: str = OFFICE):
+        return self.run_tool("legatto-breakglass", "shorten", "--minutes", minutes, "--reason", "verify.sh",
+                             "--actor", actor, "--json")
+
+    def test_shorten_moves_the_end_and_the_kernel_timeout(self) -> None:
+        out_enable = json.loads(self.enable(hours="2").stdout)
+        self.now = "2026-11-21T10:10:00Z"
+        proc = self.shorten("3")
+        self.assert_ok(proc)
+        out = json.loads(proc.stdout)
+        self.assertEqual((out["changed"], out["expires_at_before"], out["expires_at"], out["window_seconds"]),
+                         (True, "2026-11-21T12:00:00Z", "2026-11-21T10:13:00Z", 180))
+        state = self.read("var/lib/legatto/breakglass/state.json")
+        self.assertEqual((state["active"], state["expires_at"]), (True, "2026-11-21T10:13:00Z"))
+        self.assertEqual(self.sets()["bg4"], {"100.64.0.4": 180})
+        self.assertEqual(self.sets()["bg6"], {"fd7a:115c:a1e0::4": 180})
+        self.assertEqual(self.read("var/lib/legatto/status/breakglass.json")["expires_at"], "2026-11-21T10:13:00Z")
+        entry = self.audit_entries()[-1]
+        self.assertEqual(entry["event"], "breakglass.shorten")
+        self.assertEqual(entry["params"], {"window_id": out_enable["window_id"], "minutes": 3, "reason": "verify.sh",
+                                           "expires_at_before": "2026-11-21T12:00:00Z",
+                                           "expires_at": "2026-11-21T10:13:00Z"})
+        self.assertEqual(self.loaded_variant(), "breakglass")  # still open, no session cut
+        self.now = "2026-11-21T10:12:59Z"
+        self.assertEqual(json.loads(self.run_tool("legatto-breakglass", "reconcile", "--json").stdout)["action"],
+                         "sets")
+        self.now = "2026-11-21T10:13:00Z"
+        proc = self.run_tool("legatto-breakglass", "reconcile", "--json")
+        self.assert_ok(proc)
+        self.assertEqual(json.loads(proc.stdout)["action"], "expired")
+        self.assertEqual(self.sets()["bg4"], {})
+        self.assertEqual(self.loaded_variant(), "normal")
+        self.assertEqual(self.events()[-1], "breakglass.expire")
+        self.assert_ok(self.run_tool("legatto-audit", "verify"))
+
+    def test_shorten_never_extends(self) -> None:
+        self.assert_ok(self.enable(hours="1"))
+        self.now = "2026-11-21T10:58:00Z"
+        events = self.events()
+        proc = self.shorten("5")
+        self.assert_ok(proc)
+        out = json.loads(proc.stdout)
+        self.assertEqual((out["changed"], out["expires_at"], out["window_seconds"]),
+                         (False, "2026-11-21T11:00:00Z", 120))
+        self.assertEqual(self.read("var/lib/legatto/breakglass/state.json")["expires_at"], "2026-11-21T11:00:00Z")
+        self.assertEqual(self.events(), events)  # nothing changed, nothing audited
+
+    def test_shorten_arguments_and_state(self) -> None:
+        self.assertEqual(self.shorten("3").returncode, 20)  # no window
+        self.assert_ok(self.enable())
+        for minutes in ("1", "0", "-5", "481", "x"):
+            with self.subTest(minutes=minutes):
+                self.assertEqual(self.shorten(minutes).returncode, 2)
+        self.assertEqual(self.shorten("3", actor="{}").returncode, 2)
+        proc = self.run_tool("legatto-breakglass", "shorten", "--minutes", "3", "--reason", "linia\ndruga",
+                             "--actor", OFFICE)
+        self.assertEqual(proc.returncode, 2)
+        self.assertEqual(self.read("var/lib/legatto/breakglass/state.json")["expires_at"], "2026-11-21T11:00:00Z")
+        self.now = "2026-11-21T11:00:00Z"  # expired but not yet reconciled
+        self.assertEqual(self.shorten("3").returncode, 20)
+
     def test_failed_assertion_exit_21_and_error_entry(self) -> None:
         self.set_fake({"netmap_broken": True})
         proc = self.run_tool("legatto-breakglass", "enable", "--hours", "1", "--reason", REASON, "--actor", OFFICE,

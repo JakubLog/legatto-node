@@ -64,7 +64,7 @@ CONTAINER_DB = "supabase-db"  # contract: legatto_container_db
 # Container images: the app image of the installed release, by digest (R6).
 APP_IMAGE_NAME = "app"
 ENV_KEYS_REQUIRED = ("LEGATTO_SLUG", "LEGATTO_OFFICE_DOMAIN", "LEGATTO_HOST_SITE", "LEGATTO_HOST_VPN",
-                     "LEGATTO_HOST_CRM", "LEGATTO_HOST_ADMIN", "LEGATTO_HOST_STUDIO", "LEGATTO_TS_IP4",
+                     "LEGATTO_HOST_CRM", "LEGATTO_HOST_ADMIN", "LEGATTO_TS_IP4",
                      "LEGATTO_TS_IP6", "LEGATTO_PUBLIC_IPV4")
 
 # Common exit codes (CONTRACT §4.6).

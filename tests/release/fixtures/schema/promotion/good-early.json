@@ -1,0 +1,11 @@
+{
+  "canary_attestation_sha256": "bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb",
+  "channel": "early",
+  "manifest_sha256": "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa",
+  "product": "legatto",
+  "promoted_at": "2026-11-22T12:00:00Z",
+  "schema": "legatto-promote/1",
+  "sequence": 12,
+  "type": "feature",
+  "version": "1.5.0"
+}

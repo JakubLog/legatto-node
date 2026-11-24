@@ -88,7 +88,10 @@ def build_parser():
     s = cmd("approve")
     s.add_argument("--release", type=_semver, required=True)
     s.add_argument("--manifest-sha256", type=_sha, required=True)
-    s.add_argument("--not-before", type=_ts)
+    when = s.add_mutually_exclusive_group()
+    when.add_argument("--not-before", type=_ts)
+    when.add_argument("--install-now", action="store_true",
+                      help="install as soon as promotion and channel delay allow, outside the install window")
     s.add_argument("--actor", type=_actor, required=True)
     s = cmd("reject")
     s.add_argument("--release", type=_semver, required=True)
@@ -101,8 +104,8 @@ def build_parser():
     s = cmd("autosecurity")
     s.add_argument("--enabled", type=_bool, required=True)
     s.add_argument("--actor", type=_actor, required=True)
-    s = cmd("bootstrap")
-    s.add_argument("--bundle", required=True)
+    s = cmd("bootstrap", help="first installation from the update server (policy update_base_url)")
+    s.add_argument("--bundle", help="local release mirror instead of the update server (env=test only)")
     s.add_argument("--actor", type=_actor, required=True)
     s = cmd("attest")
     s.add_argument("--release", type=_semver, required=True)
@@ -143,7 +146,7 @@ def dispatch(args, host) -> Result:
     if cmd == "verify":
         return eng.cmd_verify(args.release)
     if cmd == "approve":
-        return eng.cmd_approve(args.release, args.manifest_sha256, args.not_before)
+        return eng.cmd_approve(args.release, args.manifest_sha256, args.not_before, args.install_now)
     if cmd == "reject":
         if len(args.reason) > 500:
             raise Usage("--reason longer than 500 characters")
@@ -153,7 +156,7 @@ def dispatch(args, host) -> Result:
     if cmd == "autosecurity":
         return eng.cmd_autosecurity(args.enabled)
     if cmd == "bootstrap":
-        return eng.cmd_bootstrap(os.path.abspath(args.bundle))
+        return eng.cmd_bootstrap(os.path.abspath(args.bundle) if args.bundle else None)
     if cmd == "attest":
         return eng.cmd_attest(args.release, os.path.abspath(args.report))
     raise Usage("unknown command %s" % cmd)

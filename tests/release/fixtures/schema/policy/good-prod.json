@@ -1,0 +1,28 @@
+{
+  "auto_security": true,
+  "channel": "stable",
+  "clock_jump_block_minutes": 60,
+  "env": "prod",
+  "health_timeout_seconds": 180,
+  "index_max_validity_days": 35,
+  "install_window": {
+    "end": "05:00",
+    "start": "22:00"
+  },
+  "keep_releases": 2,
+  "max_bundle_bytes": 8589934592,
+  "min_delay_hours": {
+    "feature": {
+      "early": 24,
+      "stable": 48
+    },
+    "security": {
+      "early": 2,
+      "stable": 4
+    }
+  },
+  "schema": "legatto-policy/1",
+  "signatures_required": 1,
+  "timezone": "Europe/Warsaw",
+  "update_base_url": "https://updates.legatto.pl/v1"
+}

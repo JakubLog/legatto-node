@@ -171,20 +171,33 @@ class Engine:
             result.code = code
         return result
 
-    def cmd_bootstrap(self, bundle_dir: str) -> Result:
+    def cmd_bootstrap(self, bundle_dir) -> Result:
+        """First installation. Production downloads the release from the update server
+        (policy update_base_url, through the egress proxy) and verifies it exactly like
+        `run`: index, manifest, promotion for the office channel, artifacts. A local
+        mirror (`--bundle`) is accepted only on a test office (policy env=test)."""
         self.prepare()
         if self.store.state.get("installed"):
             raise Precondition("a release is already installed; use run")
-        if not os.path.isfile(os.path.join(bundle_dir, const.LAYOUT_INDEX)):
-            raise Precondition("%s has no %s" % (bundle_dir, const.LAYOUT_INDEX))
-        src = DirSource(bundle_dir)
+        if bundle_dir is None:
+            src = self.remote()
+        else:
+            if self.policy["env"] != "test":
+                raise Precondition("--bundle is accepted only with policy env=test; bootstrap downloads from %s"
+                                   % self.policy["update_base_url"])
+            if not os.path.isfile(os.path.join(bundle_dir, const.LAYOUT_INDEX)):
+                raise Precondition("%s has no %s" % (bundle_dir, const.LAYOUT_INDEX))
+            src = DirSource(bundle_dir)
         ev = self.refresh(src, fetch=True, bootstrap=True)
         chosen = ev["chosen"]
         if chosen is None:
             self.finish()
             code = self.exit_for(ev)
+            channel = self.policy["channel"]
+            hint = "" if channel == "canary" else " (kanał %s wymaga atestacji canary i promocji)" % channel
             return Result(code if code != const.EXIT_OK else const.EXIT_GATE, "nothing_installable",
-                          "Paczka nie zawiera wydania, które można zainstalować na tym kanale.", self._ev_data(ev))
+                          "%s nie ma wydania, które można zainstalować na kanale %s%s."
+                          % (src.describe(), channel, hint), self._ev_data(ev))
         return self.install(chosen, bootstrap=True)
 
     def _ev_data(self, ev: dict) -> dict:
@@ -200,7 +213,11 @@ class Engine:
         previous = st.get("installed")
         app = Appliers(self.host, self.store, self.policy, self.office_env, self.actor)
         art_dir = self.chain.artifact_dir(version)
-        need = 2 * sum(a["size"] for a in manifest["artifacts"])
+        # Images already in the local store (same repo@digest) are not loaded again;
+        # the rest needs room for the load, staged files are hard links.
+        to_load = app.archives_to_load(manifest)
+        need = 2 * sum(a["size"] for a in manifest["artifacts"]
+                       if a["kind"] != "oci-archive" or a["name"] in to_load)
         free = shutil.disk_usage(_existing_parent(self.host.p(const.RELEASES))).free
         if free < need:
             self.finish()
@@ -238,7 +255,7 @@ class Engine:
         os.replace(stage, release)
         steps = []
         try:
-            app.load_images(manifest, art_dir)
+            app.load_images(manifest, art_dir, to_load)
             app.maintenance()
             app.switch(manifest, version, bin_stage, steps)
             failing = app.health(manifest)
@@ -430,7 +447,9 @@ class Engine:
                 return c
         return None
 
-    def cmd_approve(self, release: str, sha: str, not_before) -> Result:
+    def cmd_approve(self, release: str, sha: str, not_before, install_now=False) -> Result:
+        """Office-admin consent. install_now: install once promotion and the channel delay
+        allow, outside the install window; the update service is started at once."""
         self.prepare()
         cand = self._find_pending(release, sha)
         if cand is None or not cand["verify"]["ok"] and cand["verify"]["code"] not in ("declined", "install-failed"):
@@ -441,17 +460,43 @@ class Engine:
             parse_ts(not_before)
         now = fmt_ts(self.host.now())
         actor = {k: v for k, v in self.actor.items()}
-        self.store.admin["approvals"][sha] = {"version": release, "ts": now, "not_before": not_before, "actor": actor}
+        self.store.admin["approvals"][sha] = {"version": release, "ts": now, "not_before": not_before,
+                                              "install_now": bool(install_now), "actor": actor}
         self.store.admin["rejections"].pop(sha, None)
         self.store.state["flags"]["rb"] = None
         self.store.save()
-        self.audit.append("approved", {"version": release, "manifest_sha256": sha, "not_before": not_before},
-                          self.actor)
+        self.audit.append("approved", {"version": release, "manifest_sha256": sha, "not_before": not_before,
+                                       "install_now": bool(install_now)}, self.actor)
         ev = self.refresh(None, fetch=False)
         self.finish()
-        window = self.policy["install_window"]
-        return Result(const.EXIT_OK, "approved", "Wydanie %s zatwierdzone; instalacja w oknie %s–%s."
-                      % (release, window["start"], window["end"]), self._ev_data(ev))
+        data = self._ev_data(ev)
+        if not install_now:
+            window = self.policy["install_window"]
+            return Result(const.EXIT_OK, "approved", "Wydanie %s zatwierdzone; instalacja w oknie %s–%s."
+                          % (release, window["start"], window["end"]), data)
+        data["install_now"] = True
+        cand = next((c for c in ev["candidates"] if c["manifest_sha256"] == sha), None)
+        state = cand["state"] if cand else None
+        if state == "ready":
+            try:
+                rc, _out, err = self.host.run(["systemctl", "start", "--no-block", const.UNIT_UPDATE_SERVICE],
+                                              check=False, timeout=60)
+            except CommandError as exc:
+                rc, err = exc.rc, str(exc)
+            if rc == 0:
+                return Result(const.EXIT_OK, "approved", "Wydanie %s zatwierdzone; instalacja rozpoczęta w tle."
+                              % release, data)
+            return Result(const.EXIT_OK, "approved", "Wydanie %s zatwierdzone do instalacji teraz; nie udało się "
+                          "uruchomić usługi (%s), instalacja przy następnym sprawdzeniu." % (release, err.strip()[-200:]),
+                          data)
+        if state == "waiting-delay":
+            when = "po upływie opóźnienia kanału (najwcześniej %s UTC)" % cand["earliest_install_at"]
+        elif state == "waiting-promotion":
+            when = "po promocji na kanał %s" % self.policy["channel"]
+        else:
+            when = "gdy pozostałe warunki zostaną spełnione (%s)" % (state or "brak kandydata")
+        return Result(const.EXIT_OK, "approved", "Wydanie %s zatwierdzone do instalacji poza oknem; zainstaluje się %s."
+                      % (release, when), data)
 
     def cmd_reject(self, release: str, sha: str, reason: str) -> Result:
         self.prepare()

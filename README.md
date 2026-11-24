@@ -10,31 +10,31 @@ Kod jest publiczny, żeby biuro, audytor albo dziennikarz mógł sprawdzić mode
 |---|---|
 | `updater/` | `legatto-update`: pobiera wydania, weryfikuje podpisy (sshsig), sumy, kanały i opóźnienia, czeka na zgodę biura, instaluje, wycofuje |
 | `office-console/` | panel admina biura (`admin.app.<domena>`) i jego uprzywilejowany wykonawca: break-glass, wydania, urządzenia, funkcje, pakiet odzyskiwania |
-| `sbin/` | narzędzia hosta: `legatto-breakglass`, `legatto-policy`, `legatto-audit`, `legatto-fw`, `legatto-tailnet`, `legatto-health`, `legatto-pgdump`, `legatto-restore-test`, `legatto-recovery-pack`, `legatto-secrets`, `legatto-studio`, `legatto-stack`, `legatto-acme` |
+| `sbin/` | narzędzia hosta: `legatto-breakglass`, `legatto-policy`, `legatto-audit`, `legatto-fw`, `legatto-tailnet`, `legatto-health`, `legatto-pgdump`, `legatto-restore-test`, `legatto-recovery-pack`, `legatto-secrets`, `legatto-stack`, `legatto-acme` |
 | `egress/` | `legatto-egress`: allowlista ruchu wychodzącego (proxy Smokescreen + nftables), obraz proxy |
 | `headscale/` | szablon polityki ACL tailnetu (personel, urządzenia biura, dostawca tylko w oknie break-glass) |
 | `bundle/` | zawartość paczki wydania: compose (Supabase upstream + override), strony Caddy, jednostki systemd, dane allowlisty egress |
 | `worker/` | Cloudflare Worker formularza na stronie posła (szyfrogram z przeglądarki → kolejka) |
 | `site-publisher/` | narzędzia hosta strony publicznej i odbioru formularza (`legatto-intake`, `legatto-site-publish`, `legatto-worker-deploy`, `legatto-cf-bootstrap`) |
-| `release/schema/` | schematy dokumentów wydań: manifest, promocja, atestacja canary, indeks, polityka serwera |
+| `release/` | budowa paczki wydania (`build.sh`: z tego commita i przypiętego wydania aplikacji `app.lock`; specyfikacje i changelogi `notes/<wersja>.{json,md}`), wspólny kod narzędzi wydań (`lib/`), schematy dokumentów wydań (`schema/`: manifest, promocja, atestacja canary, indeks, polityka serwera) |
 | `contract/` | kontrakt: nazwy, ścieżki, porty, jednostki, CLI (`contract.yml`) i przypięte wersje (`versions.yml`) |
 | `trust/allowed_signers` | publiczne klucze, którymi podpisywane są wydania |
 | `docs/` | `ARCHITECTURE.md`, `SECURITY.md` (model zaufania, zgłaszanie podatności), `HANDOVER.md` (dla biura), `ONBOARDING-DEVICE.md` (dla personelu) |
 
 ## Czego tu nie ma
 
-Narzędzia wdrożeniowe dostawcy (playbooki instalacji, budowanie i publikacja wydań, inwentarze biur) są prywatne. Nie zmieniają tego, co serwer przyjmie: serwer instaluje tylko wydania podpisane kluczem z `trust/allowed_signers`, przechodzące kanały i bramki z `updater/`, a dostęp dostawcy otwiera wyłącznie biuro (`sbin/legatto-breakglass`, `headscale/`).
+Narzędzia wdrożeniowe dostawcy (playbooki instalacji, podpis i publikacja wydań, inwentarze biur) są prywatne. Nie zmieniają tego, co serwer przyjmie: serwer instaluje tylko wydania podpisane kluczem z `trust/allowed_signers`, przechodzące kanały i bramki z `updater/`, a dostęp dostawcy otwiera wyłącznie biuro (`sbin/legatto-breakglass`, `headscale/`). Samą paczkę buduje publiczny `release/build.sh`, więc każdy może odtworzyć wydanie z commita i porównać je z opublikowanym manifestem.
 
 ## Sprawdzanie
 
 ```sh
-tests/run.sh                       # wszystkie testy (docker, python3 >= 3.12, yq, yamllint, shellcheck)
+tests/run.sh                       # wszystkie testy (docker, python3 >= 3.12, yq, syft, yamllint, shellcheck)
 tests/run.sh updater console       # wybrane obszary
 scripts/lint.sh                    # yamllint, shellcheck, składnia Pythona, schematy
 scripts/check-actions-pinned.sh    # akcje CI po SHA, obrazy po digest
 ```
 
-CI (`.github/workflows/`, akcje po SHA, obrazy po digest, bez sekretów): `lint`, `test` (każdy obszar osobno), `scan` (`osv-scanner` po lockfile'ach, `trivy fs`: podatności, błędy konfiguracji, sekrety), `secrets-scan` (`gitleaks` po całej historii). Zależności aktualizuje Renovate (`renovate.json`) wyłącznie przez pull requesty do ręcznego przeglądu, bez auto-merge; `contract/versions.yml` zmienia się ręcznie.
+CI (`.github/workflows/`, akcje po SHA, obrazy po digest, bez sekretów): `lint`, `test` (każdy obszar osobno), `scan` (`osv-scanner` po lockfile'ach, `trivy fs`: podatności, błędy konfiguracji, sekrety), `secrets-scan` (`gitleaks` po całej historii), `release-build` (tag `v<wersja>`: `release/build.sh` i manifest z atestacją pochodzenia — wzorzec, z którym dostawca porównuje własną budowę przed podpisem; `gh attestation verify manifest.json -R JakubLog/legatto-node`). Zależności aktualizuje Renovate (`renovate.json`) wyłącznie przez pull requesty do ręcznego przeglądu, bez auto-merge; `contract/versions.yml` zmienia się ręcznie.
 
 Weryfikacja podpisu wydania na dowolnej maszynie:
 

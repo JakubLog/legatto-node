@@ -78,7 +78,7 @@ ITEM_FILES = {"form-x25519": "form-x25519.key", "console-emergency": "console-em
 ARMOR_BEGIN = "-----BEGIN AGE ENCRYPTED FILE-----"
 ARMOR_END = "-----END AGE ENCRYPTED FILE-----"
 QR_CHUNK_BYTES = 900
-QR_HEADER_RE = re.compile(r"^LGTRP1 ([0-9]{1,2})/([0-9]{1,2}) ([0-9a-f]{8})$")
+QR_HEADER_RE = re.compile(r"^LGTRP1 ([0-9]{1,2})/([0-9]{1,2}) ([0-9a-f]{8}) ([0-9]{1,5})$")
 CARD_LINE_RE = re.compile(r"^\s*([0-9]{1,3})\s+(.+?)\s+([0-9a-f]{8})\s*$")
 SLUG_RE = re.compile(r"^[a-z][a-z0-9-]{1,30}$")
 
@@ -323,6 +323,12 @@ def passphrase() -> str:
 # --- printable card ------------------------------------------------------------------------
 
 def qr_chunks(armored: str) -> list[str]:
+    """QR payloads: header `LGTRP1 n/N tag len` + body lines.
+
+    `len` is the byte length of the body. Some decoders (zbar) read the
+    padding of an almost full symbol as an extra numeric segment and append
+    digits to the last line; the reader cuts every body to `len`.
+    """
     lines = armored.strip("\n").split("\n")
     groups: list[list[str]] = [[]]
     for line in lines:
@@ -330,7 +336,8 @@ def qr_chunks(armored: str) -> list[str]:
             groups.append([])
         groups[-1].append(line)
     tag = sha256(armored.encode())[:8]
-    return [f"LGTRP1 {i + 1}/{len(groups)} {tag}\n" + "\n".join(g) for i, g in enumerate(groups)]
+    bodies = ["\n".join(g) for g in groups]
+    return [f"LGTRP1 {i + 1}/{len(groups)} {tag} {len(body)}\n" + body for i, body in enumerate(bodies)]
 
 
 def qr_svg(payload: str) -> str:
@@ -389,6 +396,7 @@ def armored_from_text(text: str) -> str:
     if text.lstrip().startswith(ARMOR_BEGIN):
         return text.lstrip()
     chunks: dict[int, list[str]] = {}
+    lengths: dict[int, int] = {}
     total = tag = None
     current: list[str] | None = None
     numbered: dict[int, str] = {}
@@ -399,6 +407,7 @@ def armored_from_text(text: str) -> str:
             if total not in (None, count) or tag not in (None, m.group(3)):
                 raise Failure(21, "QR codes from different packs")
             total, tag = count, m.group(3)
+            lengths[index] = int(m.group(4))
             current = chunks.setdefault(index, [])
             continue
         c = CARD_LINE_RE.match(line)
@@ -416,7 +425,13 @@ def armored_from_text(text: str) -> str:
     elif chunks:
         if total is None or sorted(chunks) != list(range(1, total + 1)):
             raise Failure(21, "QR codes missing")
-        armored = "\n".join(line for i in sorted(chunks) for line in chunks[i]) + "\n"
+        bodies = []
+        for i in sorted(chunks):
+            body = "\n".join(chunks[i])
+            if len(body) < lengths[i]:
+                raise Failure(21, f"QR code {i} is incomplete")
+            bodies.append(body[:lengths[i]])  # drop decoder junk after the declared length
+        armored = "\n".join(bodies) + "\n"
         if sha256(armored.encode())[:8] != tag:
             raise Failure(21, "QR codes do not reassemble into the original pack")
     else:

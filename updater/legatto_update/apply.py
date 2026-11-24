@@ -219,19 +219,31 @@ class Appliers:
             raise ApplyError("compose", "; ".join(errors[:5]))
 
     # --- images -------------------------------------------------------------------------
-    def load_images(self, manifest: dict, art_dir: str) -> None:
-        for a in manifest["artifacts"]:
-            if a["kind"] == "oci-archive":
-                self.run("compose", ["docker", "load", "-q", "-i", os.path.join(art_dir, a["name"])], timeout=1800)
+    def image_present(self, img: dict) -> bool:
+        """repo@digest is in the local store. The digest is content-addressed and pinned by
+        the signed manifest, so a present image is exactly the one the release names."""
+        ref = "%s@%s" % (_repo(img["ref"]), img["digest"])
+        try:
+            rc, _out, _err = self.host.run(["docker", "image", "inspect", "--format", "{{.Id}}", ref],
+                                           check=False, timeout=60)
+        except CommandError:
+            return False
+        return rc == 0
+
+    def archives_to_load(self, manifest: dict) -> list:
+        """oci-archive artifacts with at least one image not yet in the local store."""
+        return [a["name"] for a in manifest["artifacts"] if a["kind"] == "oci-archive"
+                and not all(self.image_present(i) for i in manifest["images"] if i["artifact"] == a["name"])]
+
+    def load_images(self, manifest: dict, art_dir: str, names: list) -> None:
+        for name in names:
+            self.run("compose", ["docker", "load", "-q", "-i", os.path.join(art_dir, name)], timeout=1800)
         self.assert_images(manifest)
 
     def assert_images(self, manifest: dict) -> None:
         for img in manifest["images"]:
-            ref = "%s@%s" % (_repo(img["ref"]), img["digest"])
-            rc, _out, _err = self.run("compose", ["docker", "image", "inspect", "--format", "{{.Id}}", ref],
-                                      check=False, timeout=60)
-            if rc != 0:
-                raise ApplyError("compose", "image %s not present after load" % ref)
+            if not self.image_present(img):
+                raise ApplyError("compose", "image %s@%s not present after load" % (_repo(img["ref"]), img["digest"]))
 
     # --- switch ----------------------------------------------------------------------------
     def maintenance(self) -> None:

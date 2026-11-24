@@ -20,7 +20,6 @@ NAV = (
     ("dostep", "Dostęp serwisowy"),
     ("funkcje", "Funkcje"),
     ("urzadzenia", "Urządzenia"),
-    ("studio", "Studio"),
     ("odzyskiwanie", "Pakiet odzyskiwania"),
     ("kontakty", "Kontakty incydentów"),
     ("konta", "Konta panelu"),
@@ -89,7 +88,6 @@ REQUEST_LABELS = {
     "breakglass.enable": "Otwarcie dostępu serwisowego", "breakglass.disable": "Zamknięcie dostępu serwisowego",
     "update.approve": "Zatwierdzenie wydania", "update.reject": "Odrzucenie wydania",
     "update.rollback": "Wycofanie wydania", "update.autosecurity": "Automatyczne poprawki bezpieczeństwa",
-    "studio.enable": "Włączenie Studio", "studio.disable": "Wyłączenie Studio",
     "device.enroll": "Rejestracja urządzenia", "device.revoke": "Usunięcie urządzenia",
     "staff.set": "Lista personelu", "features.set": "Zmiana funkcji", "recovery.generate": "Pakiet odzyskiwania",
     "console.user.add": "Nowe konto panelu", "console.user.remove": "Usunięcie konta panelu",
@@ -387,8 +385,10 @@ class View:
         approval = detail.get("approval")
         rejection = detail.get("rejection")
         if isinstance(approval, dict):
-            parts.append(f'<p class="ok">Zatwierdzone {self.t(approval.get("ts"))}'
-                         f'{" (nie wcześniej niż " + self.t(approval.get("not_before")) + ")" if approval.get("not_before") else ""}.</p>')
+            when = (" — instalacja teraz, bez czekania na okno nocne" if approval.get("install_now") else
+                    " (nie wcześniej niż " + self.t(approval.get("not_before")) + ")" if approval.get("not_before")
+                    else "")
+            parts.append(f'<p class="ok">Zatwierdzone {self.t(approval.get("ts"))}{when}.</p>')
         if isinstance(rejection, dict):
             parts.append(f'<p class="bad">Odrzucone {self.t(rejection.get("ts"))}: {h(rejection.get("reason"))}</p>')
         if item.get("state") not in ("expired",) and isinstance(item.get("manifest_sha256"), str):
@@ -399,7 +399,14 @@ class View:
                 parts.append(self.form("wydania/zatwierdz", hidden +
                                        f'<label for="{nb}">Nie wcześniej niż (czas lokalny, opcjonalnie)</label>'
                                        f'<input id="{nb}" name="not_before" type="datetime-local">',
-                                       "Zatwierdź wydanie"))
+                                       "Zatwierdź wydanie (instalacja w oknie nocnym)"))
+                parts.append('<p class="hint"><strong>Zainstaluj teraz</strong> pomija tylko nocne okno instalacji: '
+                             'instalacja rusza zaraz po zatwierdzeniu. Nie omija obowiązkowego opóźnienia kanału '
+                             '(„Najwcześniejsza instalacja” wyżej), weryfikacji podpisów ani zgody na ruch wychodzący — '
+                             'jeśli opóźnienie jeszcze trwa, instalacja ruszy zaraz po jego upływie. Na czas '
+                             'instalacji (kilka minut) CRM jest niedostępny.</p>'
+                             + self.form("wydania/zatwierdz", hidden + '<input type="hidden" name="install_now" '
+                                         'value="true">', "Zatwierdź i zainstaluj teraz", style="secondary"))
             if not isinstance(rejection, dict):
                 rr = self.uid("rr")
                 parts.append(self.form("wydania/odrzuc", hidden +
@@ -586,28 +593,6 @@ class View:
                         f'<textarea id="staff" name="staff">{h(chr(10).join(staff))}</textarea>', "Zapisz listę")
             + "</div>")
         return self.page("Urządzenia", "".join(parts), active="urzadzenia")
-
-    # --- studio --------------------------------------------------------------------------------------------------
-    def studio(self, snap: dict) -> str:
-        section = snap.get("studio") if isinstance(snap.get("studio"), dict) else {}
-        data = section.get("data") if isinstance(section.get("data"), dict) else {}
-        parts = ['<div class="card"><p>Supabase Studio to narzędzie administracyjne bazy danych. Jest domyślnie '
-                 'wyłączone; włączaj je tylko na czas prac (wyłączy się samo).</p>']
-        if data.get("enabled"):
-            url = data.get("url")
-            link = (f'<a href="{h(url)}" rel="noopener noreferrer">{h(url)}</a>'
-                    if isinstance(url, str) and url.startswith("https://") else "")
-            parts.append(f"<p>{self.badge('włączone', 'warn')} do {self.t(data.get('expires_at'))} {link}</p>"
-                         + self.form("studio/wylacz", "", "Wyłącz Studio", style="danger"))
-        else:
-            hours = "".join(f'<option value="{n}">{n} h</option>' for n in range(1, 9))
-            parts.append(f"<p>{self.badge('wyłączone', 'muted')}</p>"
-                         + self.form("studio/wlacz", f'<label for="sh">Na ile godzin</label>'
-                                                     f'<select id="sh" name="hours">{hours}</select>', "Włącz Studio"))
-        if section and not section.get("ok", True):
-            parts.append('<p class="bad">Nie udało się odczytać stanu Studio.</p>')
-        parts.append(f'<p class="hint">Stan z {self.t(section.get("ts"))}.</p></div>')
-        return self.page("Studio na żądanie", "".join(parts), active="studio")
 
     # --- recovery ---------------------------------------------------------------------------------------------------
     def recovery(self) -> str:

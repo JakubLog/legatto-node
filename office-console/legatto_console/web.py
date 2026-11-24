@@ -230,7 +230,6 @@ class App:
             "/dostep": self.page_access,
             "/funkcje": self.page_features,
             "/urzadzenia": self.page_devices,
-            "/studio": self.page_studio,
             "/odzyskiwanie": self.page_recovery,
             "/kontakty": self.page_contacts,
             "/konta": self.page_accounts,
@@ -247,8 +246,6 @@ class App:
             "/urzadzenia/dodaj": (self.act_enroll, "urzadzenia"),
             "/urzadzenia/usun": (self.act_revoke, "urzadzenia"),
             "/urzadzenia/personel": (self.act_staff, "urzadzenia"),
-            "/studio/wlacz": (self.act_studio_enable, "studio"),
-            "/studio/wylacz": (self.act_studio_disable, "studio"),
             "/odzyskiwanie": (self.act_recovery, "odzyskiwanie"),
             "/kontakty": (self.act_contacts, "kontakty"),
             "/konta/dodaj": (self.act_user_add, "konta"),
@@ -401,9 +398,6 @@ class App:
     def page_devices(self, req: Request, session: Session) -> Response:
         return self.html(self.view(session).devices(data.snapshot()))
 
-    def page_studio(self, req: Request, session: Session) -> Response:
-        return self.html(self.view(session).studio(data.snapshot()))
-
     def page_recovery(self, req: Request, session: Session) -> Response:
         return self.html(self.view(session).recovery())
 
@@ -432,7 +426,7 @@ class App:
 
     @staticmethod
     def back_for(rtype: str) -> str:
-        return {"breakglass": "dostep", "update": "wydania", "studio": "studio", "device": "urzadzenia",
+        return {"breakglass": "dostep", "update": "wydania", "device": "urzadzenia",
                 "staff": "urzadzenia", "features": "funkcje", "recovery": "odzyskiwanie", "contacts": "kontakty",
                 "console": "konta"}.get(rtype.split(".")[0], "")
 
@@ -654,6 +648,8 @@ class App:
         not_before = form.get("not_before", "").strip()
         if not_before:
             params["not_before"] = self.local_to_utc(not_before)
+        if "install_now" in form:
+            params["install_now"] = self._bool(form["install_now"])
         return "update.approve", params, {}
 
     def local_to_utc(self, value: str) -> str:
@@ -702,12 +698,6 @@ class App:
     def act_staff(self, form: dict, session: Session) -> tuple[str, dict, dict]:
         staff = self._lines(form.get("staff", ""))
         return "staff.set", {"staff": sorted(set(staff))}, {}
-
-    def act_studio_enable(self, form: dict, session: Session) -> tuple[str, dict, dict]:
-        return "studio.enable", {"hours": self._int(form.get("hours", ""), "hours")}, {}
-
-    def act_studio_disable(self, form: dict, session: Session) -> tuple[str, dict, dict]:
-        return "studio.disable", {}, {}
 
     def act_recovery(self, form: dict, session: Session) -> tuple[str, dict, dict]:
         return "recovery.generate", {}, {}

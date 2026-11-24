@@ -81,7 +81,7 @@ FEATURE_NAMES = ["ai", "mcp", "email", "getresponse", "push", "ics", "hibp"]  # 
 # --- office.env keys (section 4.1) ----------------------------------------------
 OFFICE_ENV_KEYS = ["LEGATTO_CONTRACT_VERSION", "LEGATTO_SLUG", "LEGATTO_ENV", "LEGATTO_OFFICE_TITLE",  # contract: legatto_office_env
                    "LEGATTO_OFFICE_DOMAIN", "LEGATTO_HOST_SITE", "LEGATTO_HOST_VPN", "LEGATTO_HOST_CRM",
-                   "LEGATTO_HOST_ADMIN", "LEGATTO_HOST_STUDIO", "LEGATTO_TS_IP4", "LEGATTO_TS_IP6",
+                   "LEGATTO_HOST_ADMIN", "LEGATTO_TS_IP4", "LEGATTO_TS_IP6",
                    "LEGATTO_PUBLIC_IPV4", "LEGATTO_TZ"]
 
 # --- compose / docker ---------------------------------------------------------
@@ -101,12 +101,15 @@ COMPOSE_SECRET_PREFIXES = ["/run/legatto/keys/"]
 COMPOSE_CAP_ADD_ALLOWED: list = []
 # Profiles whose services the compose validator must see (disabled stays off).
 COMPOSE_PROFILE_DISABLED = "disabled"  # contract: legatto_compose_profile_disabled
-COMPOSE_PROFILES_CHECKED = ["admin", "tools"]  # admin (legatto_compose_profile_admin) + tools (migrator)
+COMPOSE_PROFILES_CHECKED = ["tools"]  # tools (migrator)
 CADDY_SNIPPET_FILE = "common.caddy"
 
 # --- systemd units and host tools --------------------------------------------
 UNIT_CADDY = "legatto-caddy.service"  # contract: legatto_units.caddy
 UNIT_STACK = "legatto-stack.service"  # contract: legatto_units.stack
+UNIT_UPDATE_TIMER = "legatto-update.timer"  # contract: legatto_units.update
+# approve --install-now starts this unit at once instead of waiting for the timer.
+UNIT_UPDATE_SERVICE = UNIT_UPDATE_TIMER[:-len(".timer")] + ".service"
 # Units a release may ship (applier systemd-unit) and the subset allowed to run as root.
 UNIT_NAME_PATTERNS = [
     r"legatto-stack\.service",

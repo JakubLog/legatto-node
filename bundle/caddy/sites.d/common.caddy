@@ -1,4 +1,4 @@
-# Snippets shared by crm.caddy, admin.caddy and studio.caddy. Imported at the top
+# Snippets shared by crm.caddy and admin.caddy. Imported at the top
 # level of the global /etc/caddy/Caddyfile (Ansible, role proxy) before the site
 # blocks. Release-delivered (applier caddy-site): only snippets here, no site
 # addresses, no `bind`, no global options.
@@ -42,9 +42,10 @@
 }
 
 # Supabase routes. Only these prefixes reach api-gw (Envoy); everything else goes
-# to the app. Never to api-gw from app./admin.: "/" (Studio), /pg/ (meta),
-# /mcp and /api/mcp (Studio MCP), /graphql/v1, /realtime/v1/api, /storage/v1/s3,
-# /auth/v1/admin (service-role API; admin functions call it inside legatto-int).
+# to the app. Never to api-gw from app./admin.: "/" and /pg/ (upstream gateway routes
+# to Studio and meta, which are not shipped), /mcp and /api/mcp, /graphql/v1,
+# /realtime/v1/api, /storage/v1/s3, /auth/v1/admin (service-role API; admin
+# functions call it inside legatto-int).
 (legatto_supabase_routes) {
 	@legatto_sb_block path /auth/v1/admin /auth/v1/admin/* /realtime/v1/api /realtime/v1/api/* /storage/v1/s3 /storage/v1/s3/* /graphql/v1 /graphql/v1/*
 	@legatto_sb path /auth/v1/* /rest/v1/* /storage/v1/object/* /storage/v1/bucket /storage/v1/bucket/* /storage/v1/upload/* /realtime/v1/websocket /realtime/v1/websocket/* /functions/v1/*

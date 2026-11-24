@@ -81,11 +81,10 @@ Pierwsze konto zakłada biuro przy instalacji kodem jednorazowym od dostawcy (`/
 | Strona | Co można zrobić |
 |---|---|
 | Status | stan aktualizacji, dostępu serwisowego, kopii bazy, testu odtworzenia, formularza, publikacji strony, certyfikatu, ruchu wychodzącego, dziennika audytu |
-| Wydania | zainstalowana wersja i kanał; oczekujące wydania z opisem zmian, poprawkami bezpieczeństwa i poszerzeniami ruchu wychodzącego; zatwierdzenie (opcjonalnie „nie wcześniej niż"), odrzucenie, wycofanie, włączenie i wyłączenie automatycznych poprawek bezpieczeństwa |
+| Wydania | zainstalowana wersja i kanał; oczekujące wydania z opisem zmian, poprawkami bezpieczeństwa i poszerzeniami ruchu wychodzącego; zatwierdzenie (w oknie nocnym, opcjonalnie „nie wcześniej niż", albo „Zainstaluj teraz"), odrzucenie, wycofanie, włączenie i wyłączenie automatycznych poprawek bezpieczeństwa |
 | Dostęp serwisowy | otwarcie i zamknięcie okna dla dostawcy; podsumowania okien (logowania SSH, polecenia sudo, uruchomienia Ansible, spójność dziennika) |
 | Funkcje | włączanie i wyłączanie funkcji z ruchem zewnętrznym (§6) |
 | Urządzenia | klucze rejestracji urządzeń (z kodami QR), lista urządzeń, usuwanie, lista personelu |
-| Studio | włączenie narzędzia bazy danych Supabase Studio na 1–8 h (domyślnie wyłączone) |
 | Pakiet odzyskiwania | §2 |
 | Kontakty incydentów | osoby zgłaszające naruszenia do UODO, zastępca, IOD (§7) |
 | Konta panelu | dodawanie kont (hasło startowe + QR do TOTP), nowy kod TOTP, hasło tymczasowe, usuwanie; zmiana własnego hasła |
@@ -108,7 +107,7 @@ Gdy panel nie działa, okno można otworzyć z konsoli VPS kontem `recovery` (§
 ## 5. Wydania i aktualizacje
 
 - **Poprawki bezpieczeństwa** (`security`) instalują się same w nocnym oknie instalacji, po przejściu przez serwer testowy dostawcy i minimalnych opóźnieniach (biura pilotażowe ≥ 2 h, pozostałe ≥ 4 h od zobaczenia wydania). Możesz wyłączyć automat (Wydania → „Wyłącz automatyczne poprawki"); dostawca widzi to w monitoringu, a każda poprawka będzie czekać na Twoją zgodę.
-- **Zmiany funkcjonalne** (`feature`) **nigdy nie instalują się bez Twojej zgody.** Przed zatwierdzeniem przeczytaj „Opis zmian" i sprawdź stan „czeka na Twoją decyzję". Zatwierdzone wydanie instaluje się w najbliższym oknie instalacji (albo nie wcześniej niż wskazany czas).
+- **Zmiany funkcjonalne** (`feature`) **nigdy nie instalują się bez Twojej zgody.** Przed zatwierdzeniem przeczytaj „Opis zmian" i sprawdź stan „czeka na Twoją decyzję". Zatwierdzone wydanie instaluje się w najbliższym oknie instalacji (albo nie wcześniej niż wskazany czas). „Zatwierdź i zainstaluj teraz" pomija tylko nocne okno: instalacja rusza od razu, ale nie wcześniej niż po obowiązkowym opóźnieniu kanału („Najwcześniejsza instalacja"); na kilka minut CRM jest wtedy niedostępny — wybieraj to poza godzinami pracy biura albo po uprzedzeniu zespołu.
 - **Poszerzenie ruchu wychodzącego.** Jeśli wydanie dodaje nowy adres zewnętrzny, panel pokazuje tabelę „Poszerzenie ruchu wychodzącego — wymaga Twojej zgody" (rola, host, port). Bez Twojej zgody nie zainstaluje się całe wydanie, także poprawka bezpieczeństwa.
 - **Odrzucenie** — „Odrzuć wydanie" z powodem; dostawca zobaczy to w monitoringu.
 - **Wycofanie** — Wydania → „Wycofaj wydanie" przywraca poprzednie obrazy, konfigurację i programy; baza danych zostaje bez zmian. Nieudana instalacja wycofuje się sama.

@@ -1,0 +1,13 @@
+{
+  "canary_attestation_sha256": "bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb",
+  "channel": "stable",
+  "early_promotion_sha256": "cccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccc",
+  "manifest_sha256": "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa",
+  "note": "early zdrowe 48 h",
+  "product": "legatto",
+  "promoted_at": "2026-11-24T12:00:00Z",
+  "schema": "legatto-promote/1",
+  "sequence": 12,
+  "type": "feature",
+  "version": "1.5.0"
+}

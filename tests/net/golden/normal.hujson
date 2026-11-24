@@ -12,7 +12,7 @@
   },
   "hosts": {
     "crm": "100.64.0.1/32",
-    // admin.app.<domain> and studio.app.<domain> share the IPv6 listener.
+    // admin.app.<domain> listens on the IPv6 address.
     "admin": "fd7a:115c:a1e0::1/128",
     "ssh": "100.64.0.1/32",
   },

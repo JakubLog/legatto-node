@@ -34,7 +34,6 @@ OFFICE_ENV = {
     "LEGATTO_HOST_VPN": "vpn.posel-kowalski.pl",
     "LEGATTO_HOST_CRM": "app.posel-kowalski.pl",
     "LEGATTO_HOST_ADMIN": "admin.app.posel-kowalski.pl",
-    "LEGATTO_HOST_STUDIO": "studio.app.posel-kowalski.pl",
     "LEGATTO_TS_IP4": "100.64.0.1",
     "LEGATTO_TS_IP6": "fd7a:115c:a1e0::1",
     "LEGATTO_PUBLIC_IPV4": "198.51.100.23",

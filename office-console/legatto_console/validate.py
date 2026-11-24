@@ -192,10 +192,14 @@ def params_for(rtype: str, params: Any) -> dict[str, Any]:
         _exact_keys(p, set(), {"reason"})
         return {"reason": plain_text(p.get("reason", ""), "reason", 0, contract.BREAKGLASS_REASON_MAX)}
     if rtype == "update.approve":
-        _exact_keys(p, {"release", "manifest_sha256"}, {"not_before"})
+        _exact_keys(p, {"release", "manifest_sha256"}, {"not_before", "install_now"})
         out = {"release": semver(p["release"], "release"), "manifest_sha256": sha256_hex(p["manifest_sha256"], "manifest_sha256")}
         if "not_before" in p:
             out["not_before"] = utc(p["not_before"], "not_before")
+        if "install_now" in p and boolean(p["install_now"], "install_now"):
+            if "not_before" in out:
+                raise Invalid("bad_params", "„Zainstaluj teraz” wyklucza pole „nie wcześniej niż”.")
+            out["install_now"] = True
         return out
     if rtype == "update.reject":
         _exact_keys(p, {"release", "manifest_sha256"}, {"reason"})
@@ -210,10 +214,7 @@ def params_for(rtype: str, params: Any) -> dict[str, Any]:
     if rtype == "update.autosecurity":
         _exact_keys(p, {"enabled"})
         return {"enabled": boolean(p["enabled"], "enabled")}
-    if rtype == "studio.enable":
-        _exact_keys(p, {"hours"})
-        return {"hours": int_range(p["hours"], "hours", 1, 8)}
-    if rtype in ("studio.disable", "recovery.generate", "console.login"):
+    if rtype in ("recovery.generate", "console.login"):
         _exact_keys(p, set())
         return {}
     if rtype == "device.enroll":

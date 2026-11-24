@@ -10,7 +10,7 @@
     staff      logins from /var/lib/legatto/tailnet/staff.json (office console)
     vendors    v-<name> logins from /etc/legatto/policy/static.json (Ansible)
     ts_ip4     server tailnet IPv4: crm (tcp/443) and ssh (tcp/22)
-    ts_ip6     server tailnet IPv6: admin + studio (tcp/443)
+    ts_ip6     server tailnet IPv6: admin (tcp/443)
     tags       {server, office_device}
     groups     {staff, vendor}
     ports      {ssh, https}
@@ -39,7 +39,7 @@
   },
   "hosts": {
     "crm": {{ (ts_ip4 ~ "/32") | tojson }},
-    // admin.app.<domain> and studio.app.<domain> share the IPv6 listener.
+    // admin.app.<domain> listens on the IPv6 address.
     "admin": {{ (ts_ip6 ~ "/128") | tojson }},
     "ssh": {{ (ts_ip4 ~ "/32") | tojson }},
   },

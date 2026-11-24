@@ -1,6 +1,6 @@
 #!/usr/bin/env bash
 # All tests of this repository: one run.sh per area (docs/CONTRACT.md §6).
-# Needs: docker, python3 >= 3.12, yq, yamllint, shellcheck.
+# Needs: docker, python3 >= 3.12, yq, syft (area release), yamllint, shellcheck.
 # Usage: tests/run.sh [area ...]   (default: every area)
 # Exit: 0 all areas passed, 1 at least one failed.
 set -euo pipefail
@@ -8,7 +8,7 @@ set -euo pipefail
 here=$(cd "$(dirname "$0")" && pwd)
 areas=("$@")
 if ((${#areas[@]} == 0)); then
-	areas=(net platform updater console publicsite ops egress)
+	areas=(net platform updater console publicsite ops egress release)
 fi
 
 failed=()

@@ -4,7 +4,7 @@ test image as root, linux/amd64). Mounts: the legatto-node checkout (ro; the rep
 root is derived from this file's path), /work (rw).
 
 Covers legatto-secrets (init/check/render, real paths and permissions), legatto-acme
-(install/status), legatto-stack/legatto-studio argument handling and the cron call, and
+(install/status), legatto-stack argument handling and the cron call, and
 `systemd-analyze verify` of the release units in bundle/systemd. The helpers (stub
 upstreams, certificates, unit verification) are also used by the private deployment
 tooling for the units and the Caddyfile its roles render.
@@ -28,7 +28,6 @@ REPO = os.path.dirname(os.path.dirname(os.path.dirname(os.path.abspath(__file__)
 WORK = "/work"
 SBIN = REPO + "/sbin"
 SECRETS = SBIN + "/legatto-secrets"
-STUDIO = SBIN + "/legatto-studio"
 STACK = SBIN + "/legatto-stack"
 ACME = SBIN + "/legatto-acme"
 FIXTURES = REPO + "/tests/platform/fixtures"
@@ -38,7 +37,6 @@ for _line in open(FIXTURES + "/office.env", encoding="utf-8"):
     OFFICE[_k] = _v
 CRM = OFFICE["LEGATTO_HOST_CRM"]
 ADMIN = OFFICE["LEGATTO_HOST_ADMIN"]
-STUDIO_HOST = OFFICE["LEGATTO_HOST_STUDIO"]
 TS4 = OFFICE["LEGATTO_TS_IP4"]
 TS6 = OFFICE["LEGATTO_TS_IP6"]
 
@@ -284,7 +282,7 @@ class T3Acme(unittest.TestCase):
         self.assertEqual(run([ACME, "bogus"]).returncode, 2)
 
 
-# --- legatto-stack / legatto-studio ------------------------------------------------------------
+# --- legatto-stack ------------------------------------------------------------------------------
 
 class Stub(http.server.BaseHTTPRequestHandler):
     name = "?"
@@ -348,7 +346,7 @@ def add_addresses():
             raise RuntimeError(" ".join(argv) + ": " + proc.stderr)
 
 
-class T4StackStudio(unittest.TestCase):
+class T4Stack(unittest.TestCase):
     @classmethod
     def setUpClass(cls):
         add_addresses()
@@ -396,14 +394,8 @@ class T4StackStudio(unittest.TestCase):
         self.assertEqual(run([STACK, "probe", "--surface", "crm", "no-slash"]).returncode, 2)
         self.assertEqual(run([STACK, "probe", "--surface", "nope", "/"]).returncode, 2)
         self.assertEqual(run([STACK, "bogus"]).returncode, 2)
-        self.assertEqual(run([STACK, "start", "db"]).returncode, 2, "only meta/studio may be started on demand")
-        self.assertEqual(run([STUDIO, "enable", "--hours", "9", "--actor", '{"kind":"vendor","id":"v-x"}'])
-                         .returncode, 2)
-        self.assertEqual(run([STUDIO, "enable", "--hours", "2", "--actor", "{}"]).returncode, 2)
-        self.assertEqual(run([STUDIO, "disable", "--actor", "not-json"]).returncode, 2)
-        proc = run([STUDIO, "status", "--json"])
-        doc = json.loads(proc.stdout)
-        self.assertEqual((doc["enabled"], doc["expires_at"], doc["url"]), (False, None, "https://" + STUDIO_HOST))
+        self.assertEqual(run([STACK, "start", "db"]).returncode, 2, "no on-demand services")
+        self.assertEqual(run([STACK, "stop", "studio"]).returncode, 2, "studio is not a stack service")
 
 
 # --- systemd units ------------------------------------------------------------------------------

@@ -67,7 +67,7 @@ def _db_spec(image: common.Image, creds: Credentials, command: list[str], mounts
 
 
 def deny_hosts(env: dict[str, str]) -> list[str]:
-    return [env["LEGATTO_HOST_VPN"], env["LEGATTO_HOST_CRM"], env["LEGATTO_HOST_ADMIN"], env["LEGATTO_HOST_STUDIO"],
+    return [env["LEGATTO_HOST_VPN"], env["LEGATTO_HOST_CRM"], env["LEGATTO_HOST_ADMIN"],
             f"tn.{env['LEGATTO_OFFICE_DOMAIN']}", env["LEGATTO_PUBLIC_IPV4"], env["LEGATTO_TS_IP4"], env["LEGATTO_TS_IP6"]]
 
 

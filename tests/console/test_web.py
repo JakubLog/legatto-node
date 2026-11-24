@@ -231,17 +231,17 @@ class Actions(PanelCase):
         before = self.spool_count()
         self.tree.forget_step("szef")
         form = {"totp": self.tree.totp("szef")}
-        self.assertEqual(b.request("POST", "/console/studio/wylacz", form=form)[0], 403)
-        self.assertEqual(b.request("POST", "/console/studio/wylacz", form=dict(form, csrf="forged"))[0], 403)
+        self.assertEqual(b.request("POST", "/console/dostep/zamknij", form=form)[0], 403)
+        self.assertEqual(b.request("POST", "/console/dostep/zamknij", form=dict(form, csrf="forged"))[0], 403)
         _, _, html = b.request("GET", "/console/")
-        status, _, _ = b.request("POST", "/console/studio/wylacz", form=dict(form, csrf=b.csrf(html)),
+        status, _, _ = b.request("POST", "/console/dostep/zamknij", form=dict(form, csrf=b.csrf(html)),
                                  headers={"Origin": "https://evil.example"})
         self.assertEqual(status, 403)
-        status, _, _ = b.request("POST", "/console/studio/wylacz", form=dict(form, csrf=b.csrf(html)),
+        status, _, _ = b.request("POST", "/console/dostep/zamknij", form=dict(form, csrf=b.csrf(html)),
                                  headers={"Sec-Fetch-Site": "cross-site"})
         self.assertEqual(status, 403)
         self.assertEqual(self.spool_count(), before)
-        status, headers, _ = self.action(b, "/console/studio/wylacz", {})
+        status, headers, _ = self.action(b, "/console/dostep/zamknij", {})
         self.assertEqual(status, 303)
         self.assertRegex(headers["Location"], r"^/console/zadania/[0-9A-Z]{26}$")
         status, _, html = self.follow(b, headers["Location"])
@@ -371,8 +371,6 @@ class Pages(PanelCase):
              "ip6": "fd7a:115c:a1e0::1", "online": True, "last_seen": None, "expiry": None},
             {"id": "5", "name": "biuro-laptop", "user": "biuro", "tags": ["tag:office-device"], "ip4": "100.64.0.5",
              "ip6": "fd7a:115c:a1e0::5", "online": True, "last_seen": "2026-11-21T10:00:00Z", "expiry": None}]}}})
-        t.fake(contract.CLI_STUDIO, {"status": {"rc": 0, "stdout": {"v": 1, "enabled": False, "running": False,
-                                                                    "expires_at": None, "url": None, "actor": None}}})
         t.write_json(contract.STAFF_FILE, {"v": 1, "staff": ["anna.nowak"]})
         t.ex.refresh_snapshot()
 
@@ -383,12 +381,12 @@ class Pages(PanelCase):
         expectations = {
             "/console/": ["Status serwera", "1.4.0", "podpis poprawny"],
             "/console/wydania": ["Wydanie 1.5.0", "api.example.com", "Zatwierdź wydanie", "&lt;script&gt;",
-                                 "Wyłącz automatyczne poprawki"],
+                                 "Wyłącz automatyczne poprawki", "Zatwierdź i zainstaluj teraz",
+                                 "Nie omija obowiązkowego opóźnienia kanału"],
             "/console/dostep": ["Otwórz dostęp serwisowy", "Aktualizacja"],
             "/console/dostep/okno/w1": ["v-jan", "/usr/bin/systemctl status", "SHA256:abc"],
             "/console/funkcje": ["Asystent AI", "Kalendarze ICS", "obserwacja", "1.5.0"],
             "/console/urzadzenia": ["biuro-laptop", "anna.nowak", "Utwórz klucz rejestracji"],
-            "/console/studio": ["Włącz Studio"],
             "/console/odzyskiwanie": ["Wygeneruj nowy pakiet"],
             "/console/kontakty": ["UODO", "Inspektor Ochrony Danych"],
             "/console/konta": ["szef", "anna", "Dodaj konto"],
@@ -402,6 +400,7 @@ class Pages(PanelCase):
                 for needle in needles:
                     self.assertIn(needle, html)
         self.assertEqual(b.request("GET", "/console/nie-ma")[0], 404)
+        self.assertEqual(b.request("GET", "/console/studio")[0], 404)
         self.assertEqual(b.request("GET", "/console/dostep/okno/..%2F..%2Fetc")[0], 404)
 
     def test_releases_page_warns_when_installed_release_is_yanked(self):
@@ -433,6 +432,18 @@ class Pages(PanelCase):
         argv = self.tree.calls(contract.CLI_UPDATE)[-1]["argv"]
         self.assertEqual(argv[:7], ["approve", "--release", "1.5.0", "--manifest-sha256", "c" * 64,
                                     "--not-before", "2026-11-23T02:00:00Z"])  # Warsaw (CET) -> UTC
+        self.action(b, "/console/wydania/zatwierdz", {"release": "1.5.0", "manifest_sha256": "c" * 64,
+                                                      "install_now": "true"})
+        argv = self.tree.calls(contract.CLI_UPDATE)[-1]["argv"]
+        self.assertEqual(argv[:6], ["approve", "--release", "1.5.0", "--manifest-sha256", "c" * 64, "--install-now"])
+        calls = len(self.tree.calls(contract.CLI_UPDATE))
+        before = self.spool_count()
+        status, headers, _ = self.action(b, "/console/wydania/zatwierdz", {
+            "release": "1.5.0", "manifest_sha256": "c" * 64, "install_now": "true", "not_before": "2026-11-23T03:00"})
+        self.assertEqual((status, headers["Location"]), (303, "/console/wydania"))
+        _, _, html = b.request("GET", "/console/wydania")
+        self.assertIn("wyklucza pole", html)
+        self.assertEqual((self.spool_count(), len(self.tree.calls(contract.CLI_UPDATE))), (before, calls))
         self.action(b, "/console/funkcje", {"feature": "ics", "enabled": "true",
                                             "ics_hosts": "Kalendarz.Example.pl\n\nsejm.example.pl\n"})
         doc = harness.store.read_json(self.tree.p(contract.FEATURES))

@@ -173,8 +173,35 @@ class RecoveryPack(unittest.TestCase):
         self.assertEqual(proc.returncode, 0, proc.stderr)
         self.assertTrue(json.loads(proc.stdout)["ok"])
         partial = work / "partial.txt"
-        partial.write_text("\n".join(payloads[1:]) + "\n" if len(payloads) > 1 else "LGTRP1 2/2 00000000\nx\n")
+        partial.write_text("\n".join(payloads[1:]) + "\n" if len(payloads) > 1 else "LGTRP1 2/2 00000000 1\nx\n")
         self.assertEqual(self.verify(partial).returncode, 21)
+
+    def test_qr_body_length_drops_decoder_junk(self) -> None:
+        # zbar reads the padding of an almost full symbol as a numeric segment and
+        # appends digits to the last line (seen ~1 in 75 cards); the declared body
+        # length must cut it off, and a body shorter than declared must fail.
+        svgs = re.findall(r"<svg.*?</svg>", self.card.read_text(), re.S)
+        work = Path(self.box.tmp.name) / "qr-junk"
+        work.mkdir(exist_ok=True)
+        payloads = []
+        for i, svg in enumerate(svgs):
+            (work / f"{i}.svg").write_text(svg)
+            subprocess.run(["rsvg-convert", "-z", "4", "-b", "white", "-o", str(work / f"{i}.png"),
+                            str(work / f"{i}.svg")], check=True)
+            out = subprocess.run(["zbarimg", "--raw", "-q", "-Sbinary", str(work / f"{i}.png")],
+                                 capture_output=True, check=True).stdout.decode("ascii").rstrip("\n")
+            payloads.append(out[:out.rindex("\n") + 1] + out[out.rindex("\n") + 1:][:64])
+        junk = [p + "0193575681681522" for p in payloads]
+        scanned = work / "junk.txt"
+        scanned.write_text("\n".join(junk) + "\n")
+        proc = self.verify(scanned)
+        self.assertEqual(proc.returncode, 0, proc.stderr)
+        short = list(payloads)
+        short[0] = short[0][:-5]
+        (work / "short.txt").write_text("\n".join(short) + "\n")
+        proc = self.verify(work / "short.txt")
+        self.assertEqual(proc.returncode, 21)
+        self.assertIn("incomplete", proc.stderr)
 
     def test_card_text_lines_and_crc(self) -> None:
         pre = re.findall(r"<pre>(.*?)</pre>", self.card.read_text(), re.S)[0]

@@ -24,8 +24,8 @@ IS_ROOT = os.geteuid() == 0
 ADMIN_HOST = "admin.app.legatto-example.example"
 OFFICE_IP = "fd7a:115c:a1e0::5"
 STAFF_IP = "100.64.0.7"
-FAKE_TOOLS = (contract.CLI_AUDIT, contract.CLI_BREAKGLASS, contract.CLI_UPDATE, contract.CLI_STUDIO,
-              contract.CLI_TAILNET, contract.CLI_EGRESS, contract.CLI_RECOVERY_PACK)
+FAKE_TOOLS = (contract.CLI_AUDIT, contract.CLI_BREAKGLASS, contract.CLI_UPDATE, contract.CLI_TAILNET,
+              contract.CLI_EGRESS, contract.CLI_RECOVERY_PACK)
 
 
 def console_ids() -> tuple[int, int]:

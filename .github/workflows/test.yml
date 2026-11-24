@@ -19,11 +19,20 @@ jobs:
     strategy:
       fail-fast: false
       matrix:
-        area: [net, platform, updater, console, publicsite, ops, egress]
+        area: [net, platform, updater, console, publicsite, ops, egress, release]
     steps:
       - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1  # v7.0.1
         with:
           persist-credentials: false
+      - name: Pinned release tools (syft, yq) and the containerd image store
+        if: matrix.area == 'release'
+        run: |
+          sudo release/install-tools.sh --prefix /usr/local
+          conf=/etc/docker/daemon.json
+          [[ -s "$conf" ]] || echo '{}' | sudo tee "$conf" >/dev/null
+          sudo jq '. + {"features": {"containerd-snapshotter": true}}' "$conf" | sudo tee "$conf.new" >/dev/null
+          sudo mv "$conf.new" "$conf"
+          sudo systemctl restart docker
       - name: tests/${{ matrix.area }}
         env:
           AREA: ${{ matrix.area }}

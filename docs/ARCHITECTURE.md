@@ -11,7 +11,7 @@ Oznaczenie **[VPS]** przy twierdzeniu znaczy: zachowanie sprawdzone tylko testam
 | Hetzner Cloud, projekt biura | jeden VPS (Ubuntu 24.04, amd64): Headscale, Caddy, Supabase, aplikacja, panel biura, updater, proxy egress | biuro (Owner projektu; dostawca bez stałej roli) |
 | Cloudflare, konto biura | strefa DNS domeny posła, strona posła (Pages), Worker formularza, kolejka zgłoszeń (Queues), Turnstile | biuro |
 | Cloudflare, konto dostawcy | hosting wydań `updates.legatto.pl` (R2, tylko odczyt publicznie) | dostawca |
-| VPS dostawcy | globalna instancja Uptime Kuma (monitoring push, bez danych osobowych) | dostawca |
+| VPS dostawcy (Hetzner, `status.legatto.pl`) | globalna instancja Uptime Kuma (monitoring push, bez danych osobowych) i jej strażnik, który pinguje zewnętrzny heartbeat | dostawca |
 | Maszyna kontrolna dostawcy | wdrożenie i prace serwisowe w oknie break-glass, podpis wydań kluczem sprzętowym | dostawca |
 | GitHub | `legatto-node` (to repozytorium, publiczne), `legatto` (aplikacja, publiczne); narzędzia wdrożeniowe i inwentarze biur dostawcy są prywatne | dostawca |
 
@@ -23,7 +23,6 @@ Nazwy hostów biura:
 | `vpn.<domena>` | Headscale (koordynator tailnetu) | publicznie — jedyny publiczny rekord serwera (A, bez proxy Cloudflare) |
 | `app.<domena>` | CRM | tylko MagicDNS w tailnecie, adres IPv4 tailnetu serwera |
 | `admin.app.<domena>` | panel biura (`/console/`) i funkcje wrażliwe aplikacji | tylko MagicDNS, adres IPv6 tailnetu serwera |
-| `studio.app.<domena>` | Supabase Studio, tylko na żądanie | tylko MagicDNS, adres IPv6 tailnetu serwera |
 
 Certyfikat `app.<domena>` + `*.app.<domena>` wystawia Let's Encrypt przez DNS-01 (lego, token Cloudflare ograniczony do strefy biura). Headscale ma własny certyfikat dla `vpn.<domena>` przez TLS-ALPN-01. Rekordy CAA: `vpn.` tylko `tls-alpn-01`, `app.` tylko `dns-01`.
 
@@ -66,7 +65,7 @@ flowchart LR
 
   subgraph vendorinfra["Infrastruktura dostawcy"]
     updates["updates.legatto.pl<br/>R2, tylko odczyt"]
-    kuma["Uptime Kuma<br/>VPS Mikr.us"]
+    kuma["Uptime Kuma<br/>VPS Hetzner dostawcy (status.legatto.pl)"]
   end
 
   voter -->|"HTTPS"| pages
@@ -115,12 +114,12 @@ Z internetu na serwerze widać tylko Headscale: `443/tcp` (HTTPS i DERP), `3478/
 
 | Warstwa | Składniki | Uwagi |
 |---|---|---|
-| Wejście | Caddy (`legatto-caddy`), lego (`legatto-acme`) | Caddy słucha na `ts_ip4:443` (crm) i `[ts_ip6]:443` (admin, studio); ścieżki `admin-*`, `/api/admin*`, `/api/export*` zwracają 404 na `app.` |
-| Aplikacja | Supabase self-hosted v0.8.4 (bez imgproxy, poolera, analytics), gateway `api-gw` (Envoy), obrazy `app`, `functions`, `migrator` | obrazy po digest z paczki; `app` read-only, `cap_drop ALL`, uid 65532 |
+| Wejście | Caddy (`legatto-caddy`), lego (`legatto-acme`) | Caddy słucha na `ts_ip4:443` (crm) i `[ts_ip6]:443` (admin); ścieżki `admin-*`, `/api/admin*`, `/api/export*` zwracają 404 na `app.` |
+| Aplikacja | Supabase self-hosted v0.8.4 (bez Studio, postgres-meta, imgproxy, poolera, analytics), gateway `api-gw` (Envoy), obrazy `app`, `functions`, `migrator` | obrazy po digest z paczki; `app` read-only, `cap_drop ALL`, uid 65532 |
 | Panel biura | `legatto-console` (bez uprawnień, gniazdo unix) + `legatto-console-exec` (root, spool żądań) | logowanie: hasło (scrypt) w panelu, TOTP sprawdza executor, więc przejęcie samego panelu nie wystarcza |
 | Formularz | `legatto-intake fetch` (sieć, token kolejki, bez klucza i bazy), `legatto-intake process` (klucz X25519 i baza, bez sieci) | timer co 2 min |
 | Strona | `legatto-site-publish` (timer co 1 min szuka zadań publikacji), `legatto-worker-deploy` | build bez sieci, strażnik „zero adresu biura" |
-| Aktualizacje | `legatto-update` (timer co 6 h ± 30 min) | §5 |
+| Aktualizacje | `legatto-update` (timer: canary co 15 min, early i stable co 1 h, z rozrzutem) | §5 |
 | Monitoring | `legatto-health` (co 5 min) | §4.4 |
 | Backup | `legatto-pgdump` (przed oknem backupu Hetzner), `legatto-restore-test` (pierwsza niedziela miesiąca, 11:00 UTC) | §4.5 |
 | Audyt | `legatto-audit` — jedyny zapisujący `/var/log/legatto/audit.log` (JSONL z łańcuchem hashy, `chattr +a`) | weryfikacja co 5 min, kotwica łańcucha w Kuma |
@@ -203,7 +202,7 @@ Worker wdraża `legatto-worker-deploy`, wywoływany przez updater po zielonym he
 ```mermaid
 sequenceDiagram
   autonumber
-  participant T as legatto-update.timer (co 6 h)
+  participant T as legatto-update.timer (canary 15 min, early/stable 1 h)
   participant U as legatto-update (root)
   participant R as updates.legatto.pl
   participant A as Panel biura
@@ -236,14 +235,14 @@ flowchart LR
   hjson["status/health.json<br/>msg z allowlisty pól"]
   push["legatto-health push<br/>użytkownik legatto-mon"]
   proxy["Proxy hosta 127.0.0.1:4750"]
-  kuma["Uptime Kuma na Mikr.us<br/>publicznie tylko /api/push/token"]
+  kuma["Uptime Kuma na VPS Hetzner dostawcy<br/>status.legatto.pl, publicznie tylko /api/push/token"]
 
   status --> collect --> hjson --> push --> proxy --> kuma
 ```
 
 - Payload Kuma składa się wyłącznie z pól `legatto_kuma_fields` (wersja, kanał, wynik podpisu, wiek sprawdzenia, stan aktualizacji, dysk, RAM, backup, test odtworzenia, liczba błędów, kontenery, break-glass, kotwica audytu, certyfikat, egress, liczniki formularza). Wartość niepasująca do wyrażenia z kontraktu zamienia się na `ERR`. Treść logów nie jest czytana, liczona jest tylko liczba wpisów o priorytecie 0–3.
 - `status=down`, gdy m.in.: zły podpis wydania, nieudana instalacja lub rollback, brak udanego sprawdzenia wydań od ponad 24 h, kontener unhealthy, dump starszy niż 26 h, dysk > 90 %, kolejka formularza nieodebrana > 15 min, certyfikat < 14 dni, łańcuch audytu uszkodzony.
-- Kuma działa na VPS dostawcy, za Caddy, który przepuszcza publicznie tylko `/api/push/<token>`. Dashboard jest dostępny tylko przez tunel SSH.
+- Kuma działa na VPS Hetzner dostawcy pod `status.legatto.pl` (publiczny IPv4, bo proxy hosta biura wychodzi tylko po IPv4), za Caddy, który przepuszcza publicznie tylko `/api/push/<token>`. Dashboard jest dostępny tylko przez tunel SSH. Strażnik na tym VPS co 5 min sprawdza Kumę pod jej publiczną nazwą i pinguje zewnętrzny heartbeat, który powiadamia dostawcę o awarii samej Kumy.
 
 ### 4.5 Backup
 
@@ -276,14 +275,14 @@ flowchart TB
 flowchart LR
   subgraph repos["GitHub"]
     app["legatto: CI buduje obrazy app, functions, migrator<br/>release.json + SBOM + atestacja pochodzenia"]
-    infra["CI dostawcy<br/>referencyjny manifest + atestacja"]
+    nodeci["legatto-node (publiczne): CI release-build.yml<br/>ten sam build z tagu, manifest-wzorzec<br/>+ atestacja pochodzenia"]
   end
 
   subgraph ctl["Maszyna kontrolna dostawcy"]
     lock["przypięte wydanie aplikacji<br/>po digestach"]
-    build["build<br/>paczka + niepodpisany manifest"]
+    build["build: release/build.sh z legatto-node<br/>paczka + niepodpisany manifest"]
     sign["podpis<br/>przebudowa porównawcza z CI,<br/>klucz sprzętowy: PIN + dotyk"]
-    publish["publikacja<br/>upload do R2, nowy indeks,<br/>transparency.log"]
+    publish["publikacja<br/>R2: nowe obiekty, kopia niezmienionych,<br/>nowy indeks, transparency.log"]
     promote["promocja<br/>early, potem stable"]
   end
 
@@ -300,7 +299,7 @@ flowchart LR
 
   app --> lock --> build --> sign --> publish --> idx
   publish --> rel
-  infra -.->|"manifest referencyjny"| sign
+  nodeci -.->|"manifest-wzorzec"| sign
   idx --> canary
   canary -->|"atestacja PASS"| promote
   promote --> rel
@@ -311,10 +310,10 @@ flowchart LR
 
 Kroki:
 
-1. **Wejście aplikacji.** CI repo `legatto` buduje obrazy i `release.json` (bez publikacji, bez sekretów). Narzędzie wydań dostawcy przypina to wydanie po digestach (podpisany commit) i odrzuca wydanie zbudowane z brudnego drzewa.
-2. **Build**: z zatwierdzonej treści repozytoriów, `contract/versions.yml` i `bundle/**`. Przebudowuje obrazy aplikacji z przypiętego commita i wymaga identycznych digestów. Wynik: manifest zgodny ze schematem `release/schema/manifest.schema.json`, SBOM-y i allowlista egress w `manifest.egress`.
-3. **Podpis**: przed dotknięciem klucza narzędzie sprawdza paczkę, porównuje ją z niezależnym buildem z CI (artefakt z weryfikowaną atestacją pochodzenia), pokazuje podsumowanie i diff względem poprzedniego wydania (w tym poszerzenia egress). Podpis: `ssh-keygen -Y sign -n legatto-release` kluczem `ed25519-sk` (PIN i dotyk).
-4. **Publikacja**: artefakty jako obiekty niezmienne, potem podpisy, manifest, wpis do `transparency.log` (JSONL z łańcuchem hashy), podpisany `index.json`.
+1. **Wejście aplikacji.** CI repo `legatto` buduje obrazy i `release.json` (bez publikacji, bez sekretów). Dostawca przypina to wydanie po digestach w `release/app.lock` tego repozytorium (podpisany commit); wydanie zbudowane z brudnego drzewa jest odrzucane.
+2. **Build** (`release/build.sh`, publiczny): z jednego zatwierdzonego commita `legatto-node` (`bundle/**`, `egress/`, `worker/`, `contract/versions.yml`, `release/notes/`, `release/app.lock`) i przypiętego wydania aplikacji — tylko te dwa źródła trafiają do `manifest.source`. Przebudowuje obrazy aplikacji z przypiętego commita i wymaga identycznych digestów. Obraz o niezmienionym digest zachowuje bajty archiwum z wcześniejszego wydania, więc serwer nie pobiera go ponownie. Wynik: manifest zgodny ze schematem `release/schema/manifest.schema.json`, SBOM-y i allowlista egress w `manifest.egress`. Ten sam program buduje wzorzec w CI tego repozytorium (tag `v<wersja>`), z atestacją pochodzenia, którą każdy sprawdzi `gh attestation verify`.
+3. **Podpis**: przed dotknięciem klucza narzędzie dostawcy sprawdza paczkę, porównuje ją ze wzorcem z CI `legatto-node` (artefakt z weryfikowaną atestacją pochodzenia; różnić mogą się tylko bajty archiwów obrazów, nie digesty), pokazuje podsumowanie i diff względem poprzedniego wydania (w tym poszerzenia egress). Podpis: `ssh-keygen -Y sign -n legatto-release` kluczem `ed25519-sk` (PIN i dotyk).
+4. **Publikacja**: artefakty jako obiekty niezmienne (także po stronie hostingu: blokada bucketu na `releases/`; artefakt identyczny z wcześniejszym jest kopiowany na hostingu, nie wysyłany ponownie), potem podpisy, manifest, wpis do `transparency.log` (JSONL z łańcuchem hashy), podpisany `index.json`.
 5. **Canary** instaluje każde poprawne wydanie i po testach akceptacyjnych podpisuje atestację programowym kluczem serwera canary (`legatto-update attest`, namespace `legatto-canary`). Dostawca pobiera atestację, sprawdza jej podpis i zgodność z opublikowanym manifestem, wgrywa ją jako obiekt niezmienny do `releases/<wersja>/attest/` i dopisuje wpis `release.attested` do `transparency.log` (bez użycia klucza wydań).
 6. **Promocja** do `early` i `stable`: wymaga atestacji `PASS` dla dokładnie tego manifestu; `stable` wymaga też ważnej promocji `early`. Dokument promocji i nowy indeks są podpisane kluczem sprzętowym.
 7. **Pull i weryfikacja na serwerze** (§4.3): serwer liczy minimalne opóźnienie od chwili, w której **sam** pierwszy raz zobaczył promocję swojego kanału (`promoted_at` niczego nie przyspiesza):
@@ -324,13 +323,15 @@ Kroki:
 | `security` | ≥ 2 h | ≥ 4 h |
 | `feature` | ≥ 24 h | ≥ 48 h |
 
-   Wydanie `feature` zawsze czeka na zgodę admina biura w panelu. Każde poszerzenie allowlisty egress wstrzymuje całe wydanie do zgody, niezależnie od typu. `security` instaluje się samo w oknie instalacji (`legatto_install_window`), chyba że admin wyłączył automat. Skok zegara > 60 min blokuje instalację.
+   Wydanie `feature` zawsze czeka na zgodę admina biura w panelu. Każde poszerzenie allowlisty egress wstrzymuje całe wydanie do zgody, niezależnie od typu. `security` instaluje się samo w oknie instalacji (`legatto_install_window`), chyba że admin wyłączył automat. Zgoda „zainstaluj teraz” pomija tylko okno instalacji: promocja kanału i opóźnienie od first-seen obowiązują dalej. Skok zegara > 60 min blokuje instalację.
+
+   Pierwsza instalacja (`legatto-update bootstrap`) też pobiera wydanie z `updates.legatto.pl` przez proxy hosta i sprawdza je jak każdą aktualizację; serwer kanału early albo stable instaluje tylko wydanie z atestacją canary i promocją na swój kanał. Niezmienione obrazy nie są pobierane ani ładowane ponownie: plik o tym samym `sha256` serwer dowiązuje z zachowanego wydania, a obraz `repo@digest` już obecny w Dockerze pomija.
 
    Indeks jest ważny 35 dni. Gdy w tym czasie nie ma nowego wydania ani promocji, dostawca podpisuje ten sam indeks ponownie z wyższym `sequence`; bez tego serwery niczego nie instalują i zgłaszają `upd=stale`. Wycofane wydanie ma w indeksie `yanked: true` z powodem: serwer pomija je przy wyborze wydań, a serwer, który już je ma, czeka na nowsze wydanie.
 
 Klucze zaufania na serwerze (`/etc/legatto/update/allowed_signers`, `policy.json`, początkowy KRL) zmienia wyłącznie dostawca w oknie break-glass otwartym przez biuro. Wymagana liczba podpisów: `signatures_required` (dziś 1).
 
-Publiczne klucze wydań: `trust/allowed_signers`. Dziś istnieje jeden klucz sprzętowy (`release-a`); zapasowy `release-b` zostanie dopisany po zakupie drugiego klucza. Bez klucza produkcyjnego w `trust/allowed_signers` serwer produkcyjny odmawia instalacji.
+Publiczne klucze wydań: `trust/allowed_signers` — `release-a` (YubiKey wydań) i `release-b` (zapasowy YubiKey offline), oba sprzętowe; do tego dwa klucze atestacji canary pod jednym principalem `canary@legatto.pl` (klucz serwera canary i zapasowy `canary-b` trzymany offline). Bez klucza produkcyjnego w `trust/allowed_signers` serwer produkcyjny odmawia instalacji.
 
 ### 5.1 Co paczka może zmienić, a co tylko break-glass
 
@@ -402,7 +403,7 @@ flowchart TB
     data[("Dane CRM, klucz formularza,<br/>klucz pól PII, Vault")]
   end
   subgraph b3["Dostawca"]
-    yubi["YubiKey wydań"]
+    yubi["YubiKey wydań + zapasowy offline"]
     ctl["Maszyna kontrolna"]
     upd["updates.legatto.pl"]
     kum["Uptime Kuma"]

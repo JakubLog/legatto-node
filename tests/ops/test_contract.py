@@ -68,7 +68,6 @@ class ContractConsistency(unittest.TestCase):
     def test_health_lists(self) -> None:
         health = load_tool(TOOLS["legatto-health"])
         self.assertEqual(list(health.COMPOSE_SERVICES), self.contract["legatto_compose_services"])
-        self.assertLessEqual(set(health.ON_DEMAND_SERVICES), set(health.COMPOSE_SERVICES))
         self.assertEqual([k for k, _ in health.KUMA_FIELDS], self.contract["legatto_kuma_fields"])
         self.assertEqual(self.contract["legatto_kuma_interval"], f"{health.INTERVAL_SECONDS // 60}min")
         self.assertEqual(dict(health.KUMA_FIELDS)["ctbad"],

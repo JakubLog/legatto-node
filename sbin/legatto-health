@@ -44,10 +44,8 @@ EGRESS_PROXY = "http://127.0.0.1:4750"             # contract: legatto_egress_pr
 STATUS_GROUP = "legatto-status"                    # contract: legatto_groups.status
 COMPOSE_PROJECT = "legatto"                        # contract: legatto_compose_project
 # contract: legatto_compose_services
-COMPOSE_SERVICES = ("db", "auth", "rest", "realtime", "storage", "functions", "api-gw", "app", "meta", "studio",
+COMPOSE_SERVICES = ("db", "auth", "rest", "realtime", "storage", "functions", "api-gw", "app",
                     "egress-app", "egress-auth", "egress-fn", "egress-intake", "egress-publish")
-# Services of the compose profile `admin` (contract: legatto_compose_profile_admin), expected only when present.
-ON_DEMAND_SERVICES = ("meta", "studio")
 ERROR_COUNT_SERVICES = ("app", "functions")
 CREDENTIAL_NAME = "kuma-push-token"                # LoadCredentialEncrypted= name in legatto-health.service
 INTERVAL_SECONDS = 300                             # contract: legatto_kuma_interval (5min)
@@ -224,7 +222,7 @@ def container_fields(containers: list[dict] | None) -> tuple[str, str]:
     by_service: dict[str, list[dict]] = {}
     for item in containers:
         by_service.setdefault(item["service"], []).append(item)
-    expected = [s for s in COMPOSE_SERVICES if s not in ON_DEMAND_SERVICES or s in by_service]
+    expected = list(COMPOSE_SERVICES)
     bad = []
     for service in expected:
         items = by_service.get(service, [])

@@ -31,7 +31,7 @@ COMPOSE = os.path.join(WORK, "release", "compose")
 ENV_DIR = os.path.join(WORK, "env")
 OFFICE_ENV = os.path.join(FIXTURES, "office.env")
 OFFICE = dict(line.rstrip("\n").split("=", 1) for line in open(OFFICE_ENV, encoding="utf-8") if "=" in line)
-TOOLS = {name: "sbin/" + name for name in ("legatto-secrets", "legatto-studio", "legatto-stack", "legatto-acme")}
+TOOLS = {name: "sbin/" + name for name in ("legatto-secrets", "legatto-stack", "legatto-acme")}
 PLACEHOLDER = re.compile(r'"@@LEGATTO_IMAGE:([a-z0-9-]+)@@"')
 
 
@@ -110,7 +110,7 @@ class T1Upstream(unittest.TestCase):
         text = open(os.path.join(COMPOSE_SRC, "supabase", "docker-compose.yml"), encoding="utf-8").read()
         upstream = dict(re.findall(r"^  ([a-z-]+):\n(?:    .*\n)*?    image: (\S+)", text, re.M))
         mapping = {"db": "db", "auth": "auth", "rest": "rest", "realtime": "realtime", "storage": "storage",
-                   "api-gw": "api_gw", "studio": "studio", "meta": "meta", "functions": "edge_runtime"}
+                   "api-gw": "api_gw", "functions": "edge_runtime"}
         for service, key in mapping.items():
             self.assertEqual("docker.io/" + upstream[service], VERSIONS["legatto_images"][key]["ref"], service)
 
@@ -120,16 +120,18 @@ class T2Compose(unittest.TestCase):
     def setUpClass(cls):
         compose("config", "--quiet")
         cls.default = json.loads(compose("config", "--format", "json").stdout)
-        cls.full = json.loads(compose("config", "--format", "json", profiles=("admin", "tools")).stdout)
-        cls.everything = json.loads(compose("config", "--format", "json",
-                                            profiles=("admin", "tools", "disabled")).stdout)
+        cls.full = json.loads(compose("config", "--format", "json", profiles=("tools",)).stdout)
+        cls.everything = json.loads(compose("config", "--format", "json", profiles=("tools", "disabled")).stdout)
 
     def test_services_and_profiles(self):
         services = set(CONTRACT["legatto_compose_services"])
-        admin = {"meta", "studio"}
-        self.assertEqual(set(self.default["services"]), services - admin)
+        self.assertEqual(set(self.default["services"]), services)
         self.assertEqual(set(self.full["services"]), services | {"migrator"})
-        self.assertEqual(set(self.everything["services"]) - set(self.full["services"]), {"imgproxy", "supavisor"})
+        self.assertEqual(set(self.everything["services"]) - set(self.full["services"]),
+                         {"imgproxy", "supavisor", "meta", "studio"})
+        for name in ("imgproxy", "supavisor", "meta", "studio"):
+            self.assertEqual(self.everything["services"][name]["profiles"],
+                             [CONTRACT["legatto_compose_profile_disabled"]], name)
         self.assertEqual(self.full["name"], CONTRACT["legatto_compose_project"])
         self.assertEqual(self.full["services"]["db"]["container_name"], CONTRACT["legatto_container_db"])
 
@@ -203,7 +205,7 @@ class T2Compose(unittest.TestCase):
         on_ext = sorted(s for s, v in self.full["services"].items()
                         if any(self.full["networks"][k]["name"] == ext for k in (v.get("networks") or {})))
         self.assertEqual(on_ext, sorted(p["service"] for p in CONTRACT["legatto_egress_container_proxies"].values()))
-        for name in ("db", "rest", "realtime", "storage", "api-gw", "meta", "studio", "migrator"):
+        for name in ("db", "rest", "realtime", "storage", "api-gw", "migrator"):
             nets = {self.full["networks"][k]["name"] for k in self.full["services"][name].get("networks") or {}}
             self.assertFalse({n for n in nets if "egress" in n}, name + " must have no egress path")
 
@@ -234,7 +236,6 @@ class T2Compose(unittest.TestCase):
             self.assertIn("no-new-privileges:true", svc.get("security_opt") or [], name)
         fn_env = self.full["services"]["functions"]["environment"]
         self.assertNotIn("SUPABASE_DB_URL", fn_env)
-        self.assertNotIn("OPENAI_API_KEY", self.full["services"]["studio"]["environment"])
         self.assertEqual(self.full["services"]["storage"]["environment"]["ENABLE_IMAGE_TRANSFORMATION"], "false")
         self.assertNotIn("IMGPROXY_URL", self.full["services"]["storage"]["environment"])
         self.assertNotIn("depends_on", self.full["services"]["api-gw"])
@@ -258,16 +259,15 @@ class T2Compose(unittest.TestCase):
         literal = re.search(r"^GOTRUE_PASSWORD_REQUIRED_CHARACTERS=(.*)$", template, re.M).group(1)
         # `compose config` prints "$" as "$$"; the container receives a single "$".
         self.assertEqual(auth["GOTRUE_PASSWORD_REQUIRED_CHARACTERS"].replace("$$", "$"), literal)
-        studio = self.full["services"]["studio"]["environment"]
-        self.assertEqual(studio["DEFAULT_ORGANIZATION_NAME"].replace("$$", "$"), OFFICE["LEGATTO_OFFICE_TITLE"])
+        app = self.full["services"]["app"]["environment"]
+        self.assertEqual(app["APP_TITLE"].replace("$$", "$"), OFFICE["LEGATTO_OFFICE_TITLE"])
 
     def test_no_unset_variables(self):
-        proc = compose("config", "--quiet", profiles=("admin", "tools", "disabled"))
+        proc = compose("config", "--quiet", profiles=("tools", "disabled"))
         self.assertNotIn("is not set", proc.stderr, proc.stderr)
 
     def test_updater_policy_accepts_and_rejects(self):
-        raw = json.loads(compose("--profile", "admin", "--profile", "tools", "config", "--format", "json",
-                                 "--no-interpolate").stdout)
+        raw = json.loads(compose("--profile", "tools", "config", "--format", "json", "--no-interpolate").stdout)
         manifest = os.path.join(WORK, "manifest.json")
 
         def verdict(cfg):

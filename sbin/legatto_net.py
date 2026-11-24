@@ -90,6 +90,10 @@ def hours(n: int) -> timedelta:
     return timedelta(hours=n)
 
 
+def minutes(n: int) -> timedelta:
+    return timedelta(minutes=n)
+
+
 # --- files -----------------------------------------------------------------------------
 
 def require_root() -> None:

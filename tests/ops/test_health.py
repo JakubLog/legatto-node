@@ -222,9 +222,10 @@ class HealthPayload(unittest.TestCase):
         self.assertEqual(fields["ctbad"], "rest,app")
         self.assertEqual(fields["ct"], "11/13")
 
-    def test_on_demand_studio_counts_only_when_present(self) -> None:
-        self.box.set_containers(dict({s: "healthy" for s in SERVICES}, studio="healthy", meta="healthy"))
-        self.assertEqual(parse_msg(self.box.dry()["msg"])["ct"], "15/15")
+    def test_container_outside_the_stack_is_ignored(self) -> None:
+        self.box.set_containers(dict({s: "healthy" for s in SERVICES}, studio="exited", meta="healthy"))
+        fields = parse_msg(self.box.dry()["msg"])
+        self.assertEqual((fields["ct"], fields["ctbad"]), ("13/13", ""))
 
     def test_uninstalled_components_are_omitted(self) -> None:
         for name in ("intake", "publish", "tls", "egress", "breakglass"):

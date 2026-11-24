@@ -46,7 +46,6 @@ class GuardTest(unittest.TestCase):
             "host-vpn": "connect to vpn.posel-kowalski.pl",
             "host-crm": "<a href=\"https://app.posel-kowalski.pl/biuro\">",
             "host-admin": "ADMIN.APP.POSEL-KOWALSKI.PL",
-            "host-studio": "studio.app.posel-kowalski.pl",
             "host-magicdns": "srv.tn.posel-kowalski.pl",
             "ip-public": "origin 198.51.100.23:443",
             "ip-tailnet4": "http://100.64.0.1/",
@@ -103,8 +102,7 @@ class PublishTest(Harness):
         self.assertFalse(any(dst.startswith("/run/credentials") for dst in build["mounts"]))
         deny = [build["command"][i + 1] for i, a in enumerate(build["command"]) if a == "--deny-host"]
         self.assertEqual(set(deny), {"vpn.posel-kowalski.pl", "app.posel-kowalski.pl", "admin.app.posel-kowalski.pl",
-                                     "studio.app.posel-kowalski.pl", "tn.posel-kowalski.pl", "198.51.100.23",
-                                     "100.64.0.1", "fd7a:115c:a1e0::1"})
+                                     "tn.posel-kowalski.pl", "198.51.100.23", "100.64.0.1", "fd7a:115c:a1e0::1"})
         self.assertEqual(deploy["network"], "legatto-egress-publish")
         self.assertEqual(deploy["env"]["HTTPS_PROXY"], "http://egress-publish:4750")
         self.assertIn("/run/credentials/legatto-cf-pages-token", deploy["mounts"])
